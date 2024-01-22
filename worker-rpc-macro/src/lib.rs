@@ -92,7 +92,7 @@ impl<'a> ServiceGenerator<'a> {
                     #camel_case_ident ( #ty )
                 },
                 _ => quote! {
-                    #camel_case_ident
+                    #camel_case_ident ( () )
                 },
             });
         quote! {
@@ -268,12 +268,12 @@ impl<'a> ServiceGenerator<'a> {
                     (true, false) => quote! {
                         let __post = worker_rpc::js_sys::Array::of1(__response.as_ref());
                         let __transfer = worker_rpc::js_sys::Array::new();
-                        (Self::Response::#camel_case_ident, __post, __transfer)
+                        (Self::Response::#camel_case_ident(()), __post, __transfer)
                     },
                     (true, true) => quote! {
                         let __post = worker_rpc::js_sys::Array::of1(__response.as_ref());
                         let __transfer = worker_rpc::js_sys::Array::of1(__response.as_ref());
-                        (Self::Response::#camel_case_ident, __post, __transfer)
+                        (Self::Response::#camel_case_ident(()), __post, __transfer)
                     }
                 };
                 let args = args.iter().filter_map(|arg| match &*arg.pat {
