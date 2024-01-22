@@ -312,8 +312,8 @@ impl<'a> ServiceGenerator<'a> {
                     }
                 }
             }
-            impl<I: #service_ident> #server_ident<I> {
-                #vis fn new(server_impl: I) -> Self {
+            impl<T: #service_ident> #server_ident<T> {
+                #vis fn new(server_impl: T) -> Self {
                     Self { server_impl }
                 }
             }

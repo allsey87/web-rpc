@@ -77,6 +77,13 @@ pub type ClientRequestSender<C> = mpsc::UnboundedSender<(
     oneshot::Sender<(<C as Client>::Response, Array)>
 )>;
 
+type ClientRequestReceiver<C> = mpsc::UnboundedReceiver<(
+    <C as Client>::Request,
+    Array,
+    Array,
+    oneshot::Sender<(<C as Client>::Response, Array)>
+)>;
+
 impl Client for WithoutClient {
     type Request = ();
     type Response = ();
@@ -156,14 +163,8 @@ impl<C> std::ops::Deref for ConnectedInterface<C> {
     }
 }
 
-#[allow(clippy::type_complexity)]
 async fn run<C, S, I>(
-    mut client_requests_rx: mpsc::UnboundedReceiver<(
-        C::Request,
-        Array,
-        Array,
-        oneshot::Sender<(C::Response, Array)>
-    )>,
+    mut client_requests_rx: ClientRequestReceiver<C>,
     server: S,
     interface: I
 ) where
