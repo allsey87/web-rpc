@@ -1,10 +1,18 @@
 [package]
 name = "worker-rpc"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-worker-rpc-macro = { path = "../worker-rpc-macro" }
+worker-rpc-macro = { path = "../worker-rpc-macro", version = "0.0.1" }
 bincode = "1.3.3"
 wasm-bindgen-futures = "0.4"
 wasm-bindgen = "0.2.87"
@@ -17,6 +25,5 @@ futures-core = "0.3.30"
 futures-util = { version = "0.3.30", features = ["channel"] }
 
 [dev-dependencies]
-#console_error_panic_hook = "0.1.7"
 wasm-bindgen-test = "0.3.0"
 web-sys = { version = "0.3", features = ["MessagePort", "MessageChannel"] }

@@ -1,0 +1,15 @@
+[workspace]
+members = ["worker-rpc", "worker-rpc-macro"]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+authors = ["Michael Allwright <michael.allwright@rustify.be>"]
+description = "Bi-directional RPC for Web Workers and Channels"
+repository = "https://github.com/rustifybe/worker-rpc"
+homepage = "https://github.com/rustifybe/worker-rpc"
+readme = "README.md"
+license = "MIT"
+keywords = ["javascript", "rpc", "worker", "channel"]
+categories = ["web-programming", "wasm"]

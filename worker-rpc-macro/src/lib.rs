@@ -24,7 +24,6 @@ macro_rules! extend_errors {
     };
 }
 
-#[derive(Debug)]
 struct Service {
     attrs: Vec<Attribute>,
     vis: Visibility,
@@ -32,7 +31,6 @@ struct Service {
     rpcs: Vec<RpcMethod>,
 }
 
-#[derive(Debug)]
 struct RpcMethod {
     is_async: bool,
     attrs: Vec<Attribute>,
