@@ -183,7 +183,9 @@ impl<'a> ServiceGenerator<'a> {
                 } else {
                     quote! {
                         let (__serialize_return, _) = __callback_rx.await.unwrap();
-                        let #response_ident::#camel_case_ident(__inner) = __serialize_return;
+                        let #response_ident::#camel_case_ident(__inner) = __serialize_return else {
+                            panic!("received incorrect response variant")
+                        };
                         worker_rpc::Result::Ok(__inner)
                     }
                 };
