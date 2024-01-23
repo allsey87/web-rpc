@@ -14,20 +14,9 @@ pub use serde;
 pub use js_sys;
 pub use wasm_bindgen;
 
-// use wasm_bindgen::prelude::wasm_bindgen;
-// #[wasm_bindgen]
-// extern "C" {
-//     #[wasm_bindgen(js_namespace = console)]
-//     fn log(s: &str);
-
-//     #[wasm_bindgen(js_namespace = console, js_name = log)]
-//     fn log_jsvalue(v: &JsValue);
-// }
-
 #[derive(Debug)]
 pub enum Error {
     EncodeDecode(bincode::ErrorKind),
-    BadResponse,
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
