@@ -209,27 +209,28 @@ impl<'a> ServiceGenerator<'a> {
                         Pat::Ident(ident) if transfer.contains(&ident.ident) => Some(&ident.ident),
                         _ => None
                     });
-                let return_response = if post.contains(&Ident::new("return", output.span())) {
+                let unpack_response = if post.contains(&Ident::new("return", output.span())) {
                     quote! {
-                        let (_, __post_return) = __callback_rx.await.unwrap();
-                        let __post_return =
-                            worker_rpc::wasm_bindgen::JsCast::dyn_into::<#output>(__post_return.shift())
-                                .unwrap();
-                        worker_rpc::Result::Ok(__post_return)
+                        let (_, __post_response) = response;
+                        worker_rpc::wasm_bindgen::JsCast::dyn_into::<#output>(__post_response.shift())
+                            .unwrap()
                     }
                 } else {
                     quote! {
-                        let (__serialize_return, _) = __callback_rx.await.unwrap();
-                        let #response_ident::#camel_case_ident(__inner) = __serialize_return else {
+                        let (__serialize_response, _) = response;
+                        let #response_ident::#camel_case_ident(__inner) = __serialize_response else {
                             panic!("received incorrect response variant")
                         };
-                        worker_rpc::Result::Ok(__inner)
+                        __inner
                     }
                 };
 
                 quote! {
                     #( #attrs )*
-                    #vis async fn #ident(&self, #( #args ),*) -> worker_rpc::Result<#output> {
+                    #vis fn #ident(
+                        &self,
+                        #( #args ),*
+                    ) -> worker_rpc::client::RequestFuture<worker_rpc::Result<#output>> {
                         let __request = #request_ident::#camel_case_ident {
                             #( #serialize_arg_idents ),*
                         };
@@ -238,24 +239,33 @@ impl<'a> ServiceGenerator<'a> {
                         let __transfer: &[&wasm_bindgen::JsValue] = &[#( #transfer_arg_idents.as_ref() ),*];
                         let __transfer = worker_rpc::js_sys::Array::from_iter(__transfer);
 
-                        let (__callback_tx, __callback_rx) = worker_rpc::futures_channel::oneshot::channel();
-                        self.tx.unbounded_send((__request, __post, __transfer, __callback_tx)).unwrap();
-                        
-                        #return_response
+                        let (__cancel_tx, __cancel_rx) = worker_rpc::futures_channel::oneshot::channel();
+                        let (__response_tx, __response_rx) = worker_rpc::futures_channel::oneshot::channel();
+                        self.tx.unbounded_send((__request, __post, __transfer, __response_tx, __cancel_rx)).unwrap();
+
+                        let __response_rx =
+                            worker_rpc::futures_util::TryFutureExt::map_err(__response_rx, |_| {
+                                worker_rpc::Error::Aborted
+                            });
+                        let __response_rx =
+                            worker_rpc::futures_util::TryFutureExt::map_ok(__response_rx, |response| {
+                                #unpack_response
+                            });
+                        worker_rpc::client::RequestFuture::new(__response_rx, __cancel_tx)
                     }
                 }
             });
 
         quote! {
             #vis struct #client_ident {
-                tx: worker_rpc::ClientRequestSender<#client_ident>
+                tx: worker_rpc::client::RequestSender<#client_ident>
             }
-            impl worker_rpc::Client for #client_ident {
+            impl worker_rpc::client::Client for #client_ident {
                 type Request = #request_ident;
                 type Response = #response_ident;
             }
-            impl From<worker_rpc::ClientRequestSender<#client_ident>> for #client_ident {
-                fn from(tx: worker_rpc::ClientRequestSender<#client_ident>) -> Self {
+            impl From<worker_rpc::client::RequestSender<#client_ident>> for #client_ident {
+                fn from(tx: worker_rpc::client::RequestSender<#client_ident>) -> Self {
                     Self { tx }
                 }
             }
@@ -291,7 +301,7 @@ impl<'a> ServiceGenerator<'a> {
                             let arg_pat = &arg.pat;
                             let arg_ty = &arg.ty;
                             Some(quote! {
-                                let #arg_pat = worker_rpc::wasm_bindgen::JsCast::dyn_into::<#arg_ty>(js_args.shift())
+                                let #arg_pat = worker_rpc::wasm_bindgen::JsCast::dyn_into::<#arg_ty>(__js_args.shift())
                                     .unwrap();
                             })
                         },
@@ -319,15 +329,29 @@ impl<'a> ServiceGenerator<'a> {
                     Pat::Ident(ident) => Some(&ident.ident),
                     _ => None
                 });
-                let do_await = match is_async {
-                    true => quote!(.await),
-                    false => quote!()
-                };
-                quote! {
-                    Self::Request::#camel_case_ident { #( #serialize_arg_idents ),* } => {
-                        #( #extract_js_args )*
-                        let __response = self.server_impl.#ident(#( #args ),*)#do_await;
-                        #return_response
+                match is_async {
+                    true => quote! {
+                        Self::Request::#camel_case_ident { #( #serialize_arg_idents ),* } => {
+                            #( #extract_js_args )*
+                            let __task =
+                                worker_rpc::futures_util::FutureExt::fuse(self.server_impl.#ident(#( #args ),*));
+                            worker_rpc::pin_utils::pin_mut!(__task);
+                            worker_rpc::futures_util::select! {
+                                _ = __cancel_rx => None,
+                                __response = __task => Some({
+                                    #return_response
+                                })
+                            }
+                        }
+                    },
+                    false => quote! {
+                        Self::Request::#camel_case_ident { #( #serialize_arg_idents ),* } => {
+                            #( #extract_js_args )*
+                            let __response = self.server_impl.#ident(#( #args ),*);
+                            Some({
+                                #return_response
+                            })
+                        }
                     }
                 }
             });
@@ -336,17 +360,20 @@ impl<'a> ServiceGenerator<'a> {
             #vis struct #server_ident<I> {
                 server_impl: I
             }
-            impl<I: #service_ident> worker_rpc::Server for #server_ident<I> {
+            impl<I: #service_ident> worker_rpc::server::Server for #server_ident<I> {
                 type Request = #request_ident;
                 type Response = #response_ident;
                 async fn execute(
                     &self,
-                    request: Self::Request,
-                    js_args: worker_rpc::js_sys::Array
-                ) -> (Self::Response, worker_rpc::js_sys::Array, worker_rpc::js_sys::Array) {
-                    match request {
+                    __seq_id: u32,
+                    mut __cancel_rx: futures_channel::oneshot::Receiver<()>,
+                    __request: Self::Request,
+                    __js_args: worker_rpc::js_sys::Array
+                ) -> (u32, Option<(Self::Response, worker_rpc::js_sys::Array, worker_rpc::js_sys::Array)>) {
+                    let __result = match __request {
                         #( #handlers )*
-                    }
+                    };
+                    (__seq_id, __result)
                 }
             }
             impl<T: #service_ident> #server_ident<T> {
