@@ -27,3 +27,4 @@ futures-util = { version = "0.3.30", features = ["channel"] }
 [dev-dependencies]
 wasm-bindgen-test = "0.3.0"
 web-sys = { version = "0.3", features = ["MessagePort", "MessageChannel"] }
+gloo-timers = { version = "0.3", features = ["futures"] }

@@ -129,10 +129,47 @@ impl<'a> ServiceGenerator<'a> {
                 }
             });
 
+        let forward_fns = rpcs.iter()
+            .map(|RpcMethod { attrs, args, ident, is_async, output, .. }| {
+                let output = match output {
+                    ReturnType::Type(_, ref ty) => ty,
+                    ReturnType::Default => unit_type
+                };
+                let do_await = match is_async {
+                    true => quote!(.await),
+                    false => quote!()
+                };
+                let is_async = match is_async {
+                    true => quote!(async),
+                    false => quote!()
+                };
+                let forward_args = args.iter().filter_map(|arg| match &*arg.pat {
+                    Pat::Ident(ident) => Some(&ident.ident),
+                    _ => None
+                });
+                quote! {
+                    #( #attrs )*
+                    #is_async fn #ident(&self, #( #args ),*) -> #output {
+                        T::#ident(self, #( #forward_args ),*)#do_await
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+
         quote! {
             #( #attrs )*
             #vis trait #service_ident {
                 #( #rpc_fns )*
+            }
+
+            impl<T> #service_ident for std::sync::Arc<T> where T: #service_ident {
+                #( #forward_fns )*
+            }
+            impl<T> #service_ident for std::boxed::Box<T> where T: #service_ident {
+                #( #forward_fns )*
+            }
+            impl<T> #service_ident for std::rc::Rc<T> where T: #service_ident {
+                #( #forward_fns )*
             }
         }
     }
