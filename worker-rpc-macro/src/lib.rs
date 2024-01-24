@@ -366,7 +366,7 @@ impl<'a> ServiceGenerator<'a> {
                 async fn execute(
                     &self,
                     __seq_id: u32,
-                    mut __cancel_rx: futures_channel::oneshot::Receiver<()>,
+                    mut __cancel_rx: worker_rpc::futures_channel::oneshot::Receiver<()>,
                     __request: Self::Request,
                     __js_args: worker_rpc::js_sys::Array
                 ) -> (u32, Option<(Self::Response, worker_rpc::js_sys::Array, worker_rpc::js_sys::Array)>) {
