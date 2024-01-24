@@ -1,6 +1,7 @@
 use std::{collections::HashMap, marker::PhantomData};
 
 use futures_channel::{oneshot, mpsc};
+use futures_core::Future;
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered, future::RemoteHandle};
 use gloo_events::EventListener;
 use js_sys::{Uint8Array, Array, ArrayBuffer};
@@ -112,6 +113,8 @@ async fn run<C, S, I>(
     let (client_responses_tx, mut client_responses_rx) = mpsc::unbounded();
     let (server_requests_tx, mut server_requests_rx) = mpsc::unbounded();
     let (abort_requests_tx, mut abort_requests_rx) = mpsc::unbounded();
+
+    interface.pre_attach().await;
     let _listener = EventListener::new(interface.event_target(), "message", move |event| {
         let array = event.unchecked_ref::<MessageEvent>()
             .data()
@@ -128,7 +131,7 @@ async fn run<C, S, I>(
                 abort_requests_tx.unbounded_send(seq_id).unwrap(),
         }
     });
-    interface.prepare();
+    interface.post_attach().await;
 
     let mut last_seq_id: u32 = 0;   
     let mut client_tasks: HashMap<u32, oneshot::Sender<_>> = Default::default();
@@ -213,7 +216,8 @@ pub trait SendRecv {
         message: &JsValue,
         transfer: &JsValue
     ) -> std::result::Result<(), JsValue>;
-    fn prepare(&self) {}
+    fn pre_attach(&self) -> impl Future<Output = ()> { async {} }
+    fn post_attach(&self) -> impl Future<Output = ()> { async {} }
 }
 
 impl SendRecv for web_sys::DedicatedWorkerGlobalScope {
@@ -226,6 +230,10 @@ impl SendRecv for web_sys::DedicatedWorkerGlobalScope {
         transfer: &JsValue
     ) -> std::result::Result<(), JsValue> {
         self.post_message_with_transfer(message, transfer)
+    }
+    async fn post_attach(&self) {
+        /* indicate that this worker is ready to receive messages */
+        self.post_message(&JsValue::UNDEFINED).unwrap();
     }
 }
 
@@ -240,7 +248,13 @@ impl SendRecv for web_sys::Worker {
     ) -> std::result::Result<(), JsValue> {
         self.post_message_with_transfer(message, transfer)
     }
-    // TODO wait in prepare until worker has started?
+    async fn pre_attach(&self) {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let _ready_listener = EventListener::once(self.event_target(), "message", move |_| {
+            ready_tx.send(()).unwrap();
+        });
+        ready_rx.await.unwrap();
+    }
 }
 
 impl SendRecv for web_sys::MessagePort {
@@ -254,7 +268,7 @@ impl SendRecv for web_sys::MessagePort {
     ) -> std::result::Result<(), JsValue> {
         self.post_message_with_transferable(message, transfer)
     }
-    fn prepare(&self) {
+    async fn post_attach(&self) {
         self.start();
     }
 }
