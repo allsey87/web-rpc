@@ -1,4 +1,4 @@
-use std::{collections::HashMap, marker::PhantomData};
+use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
 use futures_channel::{oneshot, mpsc};
 use futures_core::Future;
@@ -77,18 +77,19 @@ impl<C, S, I> Interface<C, S, I> where
     pub fn connect(self) -> ConnectedInterface<C> {
         let (client_requests_tx, client_requests_rx) = mpsc::unbounded();
         let Interface { server, interface, .. } = self;
-        let (task, _task_handle) = run::<C, S, I>(client_requests_rx, server, interface)
+        let (task, task_handle) = run::<C, S, I>(client_requests_rx, server, interface)
             .remote_handle();
         wasm_bindgen_futures::spawn_local(task);
         ConnectedInterface {
-            _task_handle,
+            _task_handle: Arc::new(task_handle),
             client: C::from(client_requests_tx),
         }
     }
 }
 
+#[derive(Clone)]
 pub struct ConnectedInterface<C> {
-    _task_handle: RemoteHandle<()>,
+    _task_handle: Arc<RemoteHandle<()>>,
     client: C,
 }
 
