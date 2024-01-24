@@ -257,6 +257,7 @@ impl<'a> ServiceGenerator<'a> {
             });
 
         quote! {
+            #[derive(core::clone::Clone)]
             #vis struct #client_ident {
                 tx: worker_rpc::client::RequestSender<#client_ident>
             }
