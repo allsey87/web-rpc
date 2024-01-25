@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
+use futures_util::{future::RemoteHandle, FutureExt};
 use wasm_bindgen_test::*;
-use worker_rpc::ConnectedInterface;
 
 #[worker_rpc::service]
 pub trait FortyTwoService {
@@ -17,47 +17,53 @@ impl FortyTwoService for FortyTwoServiceImpl {
 #[worker_rpc::service]
 pub trait Service {
     #[post(transfer(return))]
-    fn start() -> web_sys::MessagePort;
+    async fn start() -> web_sys::MessagePort;
 }
+
 #[derive(Default)]
 struct ServiceServerImpl {
-    interface: OnceLock<ConnectedInterface<worker_rpc::client::None>>
+    server_handle: OnceLock<RemoteHandle<()>>
 }
+
 impl Service for ServiceServerImpl {
-    fn start(&self) -> web_sys::MessagePort {
+    async fn start(&self) -> web_sys::MessagePort {
+        /* create channel */
         let channel = web_sys::MessageChannel::new().unwrap();
-        let port1 = channel.port1();
-        let port2 = channel.port2();
-        /* create the forty two service server with port1 and return port2 */
-        let server = FortyTwoServiceServer::new(FortyTwoServiceImpl);
-        let interface = worker_rpc::Interface::from(port1)
-            .with_server(server)
-            .connect();
-        /* store the interface inside the impl so that it is not dropped */
-        self.interface.set(interface)
+        /* create and spawn server (shuts down when server_handle is dropped) */
+        let (server, server_handle) = worker_rpc::Builder::new(channel.port1())
+            .with_server(FortyTwoServiceServer::new(FortyTwoServiceImpl))
+            .build().await
+            .remote_handle();
+        wasm_bindgen_futures::spawn_local(server);
+        /* store the server_handle inside the struct so that it is not dropped */
+        self.server_handle.set(server_handle)
             .map_err(|_| "OnceLock already set")
             .unwrap();
-        port2
+        /* return the second port */
+        channel.port2()
     }
 }
 
 #[wasm_bindgen_test]
 async fn inception() {
+    console_error_panic_hook::set_once();
+    /* create channel */
     let channel = web_sys::MessageChannel::new().unwrap();
-    let port1 = channel.port1();
-    let port2 = channel.port2();
-    let server = ServiceServer::new(ServiceServerImpl::default());
-    let _port1_interface = worker_rpc::Interface::from(port1)
-        .with_server(server)
-        .connect();
-    let port2_interface = worker_rpc::Interface::from(port2)
+    /* create and spawn server (shuts down when _server_handle is dropped) */
+    let (server, _server_handle) = worker_rpc::Builder::new(channel.port1())
+        .with_server(ServiceServer::new(ServiceServerImpl::default()))
+        .build().await
+        .remote_handle();
+    wasm_bindgen_futures::spawn_local(server);
+    /* create client */
+    let client = worker_rpc::Builder::new(channel.port2())
         .with_client::<ServiceClient>()
-        .connect();
-
-    let port3 = port2_interface.start().await.expect("RPC failure");
-    let port3_interface = worker_rpc::Interface::from(port3)
+        .build().await;
+    /* run test */
+    let port3 = client.start().await.expect("RPC failure");
+    let client = worker_rpc::Builder::new(port3)
         .with_client::<FortyTwoServiceClient>()
-        .connect();
-    assert_eq!(port3_interface.forty_two().await.expect("RPC failure"), 42);
+        .build().await;
+    assert_eq!(client.forty_two().await.expect("RPC failure"), 42);
 }
 

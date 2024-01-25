@@ -1,3 +1,4 @@
+use futures_util::{future::join, FutureExt};
 use wasm_bindgen_test::*;
 
 /* define the service */
@@ -13,26 +14,38 @@ impl Service for ServiceServerImpl {
     }
 }
 
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console)]
+    fn log(s: &str);
+}
+
 #[wasm_bindgen_test]
 async fn bidirectional() {
-    /* create a message channel and an interface for each port */
+    console_error_panic_hook::set_once();
+    /* create channel */
     let channel = web_sys::MessageChannel::new().unwrap();
-    let port1 = channel.port1();
-    let port2 = channel.port2();
-    let server = ServiceServer::new(ServiceServerImpl);
-    let port1_interface = worker_rpc::Interface::from(port1)
+    /* create server1 and client1 */
+    let (client1, server1) = worker_rpc::Builder::new(channel.port1())
+        .with_server(ServiceServer::new(ServiceServerImpl))
         .with_client::<ServiceClient>()
-        .with_server(server)
-        .connect();
-    let server = ServiceServer::new(ServiceServerImpl);
-    let port2_interface = worker_rpc::Interface::from(port2)
+        .build().await;
+    /* create server2 and client2 */
+    let (client2, server2) = worker_rpc::Builder::new(channel.port2())
+        .with_server(ServiceServer::new(ServiceServerImpl))
         .with_client::<ServiceClient>()
-        .with_server(server)
-        .connect();
-    
-    let (port1_result, port2_result) =
-        futures_util::join!(port1_interface.add(1, 2), port2_interface.add(3, 4));
-
-    assert_eq!(port1_result.expect("RPC failure"), 3);
-    assert_eq!(port2_result.expect("RPC failure"), 7);
+        .build().await;
+    /* spawn the servers */
+    let (server1, _server_handle1) = server1.remote_handle();
+    let (server2, _server_handle2) = server2.remote_handle();
+    wasm_bindgen_futures::spawn_local(server1);
+    wasm_bindgen_futures::spawn_local(server2);
+    /* run test */
+    match join(client1.add(1, 2), client2.add(3, 4)).await {
+        (Ok(result1), Ok(result2)) => match (result1, result2) {
+            (3, 7) => {}
+            _ => panic!("incorrect result")
+        }
+        _ => panic!("RPC error")
+    }
 }

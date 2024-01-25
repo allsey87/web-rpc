@@ -1,3 +1,4 @@
+use futures_util::FutureExt;
 use wasm_bindgen_test::*;
 
 #[worker_rpc::service]
@@ -21,17 +22,21 @@ impl Service for ServiceServerImpl {
 
 #[wasm_bindgen_test]
 async fn post() {
+    console_error_panic_hook::set_once();
+    /* create channel */
     let channel = web_sys::MessageChannel::new().unwrap();
-    let port1 = channel.port1();
-    let port2 = channel.port2();
-    let server = ServiceServer::new(ServiceServerImpl);
-    let _server_interface = worker_rpc::Interface::from(port1)
-        .with_server(server)
-        .connect();
-    let client_interface = worker_rpc::Interface::from(port2)
+    /* create and spawn server (shuts down when _server_handle is dropped) */
+    let (server, _server_handle) = worker_rpc::Builder::new(channel.port1())
+        .with_server(ServiceServer::new(ServiceServerImpl))
+        .build().await
+        .remote_handle();
+    wasm_bindgen_futures::spawn_local(server);
+    /* create client */
+    let client = worker_rpc::Builder::new(channel.port2())
         .with_client::<ServiceClient>()
-        .connect();
-    let response = client_interface.concat_with_space("hello".into(), "world".into()).await
+        .build().await;
+    /* run test */
+    let response = client.concat_with_space("hello".into(), "world".into()).await
         .expect("RPC failure");
     assert_eq!(response, "hello world");
 }

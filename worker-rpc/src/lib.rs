@@ -1,12 +1,12 @@
-use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, rc::Rc, sync::{atomic::AtomicUsize, Arc}};
 
-use futures_channel::{oneshot, mpsc};
-use futures_core::Future;
-use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered, future::RemoteHandle};
+use futures_channel::mpsc;
+use futures_core::{future::LocalBoxFuture, Future};
+use futures_util::FutureExt;
 use gloo_events::EventListener;
 use js_sys::{Uint8Array, Array, ArrayBuffer};
 use serde::{Serialize, Deserialize};
-use wasm_bindgen::{JsValue, JsCast};
+use wasm_bindgen::JsCast;
 use web_sys::MessageEvent;
 
 pub use worker_rpc_macro::service;
@@ -19,6 +19,7 @@ pub use pin_utils;
 
 pub mod client;
 pub mod server;
+pub mod interface;
 
 #[derive(Debug)]
 pub enum Error {
@@ -27,8 +28,8 @@ pub enum Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
-impl<I: SendRecv> From<I> for Interface<client::None, server::None, I> {
-    fn from(interface: I) -> Self {
+impl<I: interface::Interface> Builder<client::None, server::None, I> {
+    pub fn new(interface: I) -> Self {
         Self {
             interface,
             client: PhantomData::<client::None>,
@@ -44,232 +45,202 @@ enum Message<Request, Response> {
     Response(u32, Response),
 }
 
-pub struct Interface<C, S, I> {
+pub struct Builder<C, S, I> {
     client: PhantomData<C>,
     server: S,
     interface: I,
 }
 
-impl<C, I> Interface<C, server::None, I> {
+impl<C, I> Builder<C, server::None, I> {
     pub fn with_server<S: server::Server>(
         self,
         server: S
-    ) -> Interface<C, S, I> {
-        let Interface { interface, client, .. } = self;
-        Interface { interface, client, server }
+    ) -> Builder<C, server::Some<S>, I> {
+        let Builder { interface, client, .. } = self;
+        Builder { interface, client, server: server::Some(server) }
     }
 }
 
-impl<S, I> Interface<client::None, S, I> {
+impl<S, I> Builder<client::None, S, I> {
     pub fn with_client<C: client::Client>(
         self,
-    ) -> Interface<C, S, I> {
-        let Interface { interface, server, .. } = self;
-        Interface { interface, client: PhantomData::<C>, server }
+    ) -> Builder<client::Some<C>, S, I> {
+        let Builder { interface, server, .. } = self;
+        Builder { interface, client: PhantomData::<client::Some<C>>, server }
     }
 }
 
-impl<C, S, I> Interface<C, S, I> where
-    C: client::Client + From<client::RequestSender<C>> + 'static,
-    S: server::Server + 'static,
-    I: SendRecv + 'static {
+pub struct Server {
+    listener: Rc<EventListener>,
+    task: LocalBoxFuture<'static, ()>,
+}
 
-    pub fn connect(self) -> ConnectedInterface<C> {
-        let (client_requests_tx, client_requests_rx) = mpsc::unbounded();
-        let Interface { server, interface, .. } = self;
-        let (task, task_handle) = run::<C, S, I>(client_requests_rx, server, interface)
-            .remote_handle();
-        wasm_bindgen_futures::spawn_local(task);
-        ConnectedInterface {
-            _task_handle: Arc::new(task_handle),
-            client: C::from(client_requests_tx),
-        }
+impl Future for Server {
+    type Output = ();
+
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        self.task.poll_unpin(cx)
     }
 }
 
 #[derive(Clone)]
-pub struct ConnectedInterface<C> {
-    _task_handle: Arc<RemoteHandle<()>>,
-    client: C,
+pub struct Client<C> {
+    listener: Rc<EventListener>,
+    last_seq_id: Arc<AtomicUsize>,
+    client_impl: C
 }
 
-impl<C> std::ops::Deref for ConnectedInterface<C> {
+impl<C> std::ops::Deref for Client<C> {
     type Target = C;
     fn deref(&self) -> &Self::Target {
-        &self.client
+        &self.client_impl
     }
 }
 
-async fn run<C, S, I>(
-    mut client_requests_rx: client::RequestReceiver<C>,
-    server: S,
-    interface: I
-) where
-    C: client::Client,
-    S: server::Server,
-    I: SendRecv,
+impl<C, I> Builder<client::Some<C>, server::None, I> where
+    C: client::Client + From<client::RequestSender<C>> + 'static,
+    I: interface::Interface + 'static,
+    <C as client::Client>::Response: 'static {
+
+    pub async fn build(self) -> Client<C> {
+        let Builder { interface, ..} = self;
+        let (client_requests_tx, client_requests_rx) = mpsc::unbounded();
+        let (client_responses_tx, client_responses_rx) = mpsc::unbounded();
+                
+        interface.pre_attach().await;
+        let listener = EventListener::new(interface.as_ref(), "message", move |event| {
+            let array = event.unchecked_ref::<MessageEvent>()
+                .data()
+                .dyn_into::<Array>()
+                .unwrap();
+            let message = Uint8Array::new(&array.shift().dyn_into::<ArrayBuffer>().unwrap())
+                .to_vec();
+            match bincode::deserialize::<Message<(), C::Response>>(&message).unwrap() {
+                Message::Response(seq_id, response) =>
+                    client_responses_tx.unbounded_send((seq_id, response, array)).unwrap(),
+                _ => panic!("client received a server message"),
+            }
+        });
+        interface.post_attach().await;
+        
+        // WORK IN PROGRESS: do not rely on task so that messages can be sync
+        let temp_client_task = client::task::<C, I, ()>(
+            interface.clone(),
+            client_requests_rx,
+            client_responses_rx
+        );
+        wasm_bindgen_futures::spawn_local(temp_client_task);
+        // WORK IN PROGRESS: do not rely on task so that messages can be sync
+        
+        Client {
+            listener: Rc::new(listener),
+            last_seq_id: Default::default(),
+            client_impl: C::from(client_requests_tx)
+        }
+    }
+}
+
+impl<S, I> Builder<client::None, server::Some<S>, I> where 
+    S: server::Server + 'static,
+    I: interface::Interface + 'static,
+    <S as server::Server>::Request: 'static {
+
+    pub async fn build(self) -> Server {
+        let Builder { server: server::Some(server_impl), interface, .. } = self;
+        
+        let (server_requests_tx, server_requests_rx) = mpsc::unbounded();
+        let (abort_requests_tx, abort_requests_rx) = mpsc::unbounded();
+        
+        interface.pre_attach().await;
+        let listener = EventListener::new(interface.as_ref(), "message", move |event| {
+            let array = event.unchecked_ref::<MessageEvent>()
+                .data()
+                .dyn_into::<Array>()
+                .unwrap();
+            let message = Uint8Array::new(&array.shift().dyn_into::<ArrayBuffer>().unwrap())
+                .to_vec();
+            match bincode::deserialize::<Message<S::Request, ()>>(&message).unwrap() {
+                // rx messages for the server
+                Message::Request(seq_id, request) =>
+                    server_requests_tx.unbounded_send((seq_id, request, array)).unwrap(),
+                Message::Abort(seq_id) =>
+                    abort_requests_tx.unbounded_send(seq_id).unwrap(),
+                _ => panic!("server received a client message"),
+            }
+        });
+        interface.post_attach().await;
+        Server {
+            listener: Rc::new(listener),
+            task: server::task::<S, I, ()>(
+                server_impl,
+                interface,
+                server_requests_rx,
+                abort_requests_rx
+            ).boxed_local()
+        }
+    }
+}
+
+impl<C, S, I> Builder<client::Some<C>, server::Some<S>, I> where
+    C: client::Client + From<client::RequestSender<C>> + 'static,
+    S: server::Server + 'static,
+    I: interface::Interface + 'static,
     <S as server::Server>::Request: 'static,
     <C as client::Client>::Response: 'static {
-    /* set up the event listener */
-    let (client_responses_tx, mut client_responses_rx) = mpsc::unbounded();
-    let (server_requests_tx, mut server_requests_rx) = mpsc::unbounded();
-    let (abort_requests_tx, mut abort_requests_rx) = mpsc::unbounded();
-
-    interface.pre_attach().await;
-    let _listener = EventListener::new(interface.event_target(), "message", move |event| {
-        let array = event.unchecked_ref::<MessageEvent>()
-            .data()
-            .dyn_into::<Array>()
-            .unwrap();
-        let message = Uint8Array::new(&array.shift().dyn_into::<ArrayBuffer>().unwrap())
-            .to_vec();
-        match bincode::deserialize::<Message<S::Request, C::Response>>(&message).unwrap() {
-            Message::Response(seq_id, response) =>
-                client_responses_tx.unbounded_send((seq_id, response, array)).unwrap(),
-            Message::Request(seq_id, request) =>
-                server_requests_tx.unbounded_send((seq_id, request, array)).unwrap(),
-            Message::Abort(seq_id) =>
-                abort_requests_tx.unbounded_send(seq_id).unwrap(),
-        }
-    });
-    interface.post_attach().await;
-
-    let mut last_seq_id: u32 = 0;   
-    let mut client_tasks: HashMap<u32, oneshot::Sender<_>> = Default::default();
-    let mut server_tasks: HashMap<u32, oneshot::Sender<_>> = Default::default();
-    let mut server_responses_rx: FuturesUnordered<_> = Default::default();
-    let mut abort_requests: FuturesUnordered<_> = Default::default();
-
-    loop {
-        futures_util::select! {
-            // SERVER SIDE LOGIC
-            server_request = server_requests_rx.next() => {
-                let (seq_id, request, post_args) = server_request.unwrap();
-                let (abort_tx, abort_rx) = oneshot::channel::<()>();
-                server_tasks.insert(seq_id, abort_tx);
-                server_responses_rx.push(server.execute(seq_id, abort_rx, request, post_args));
-            },
-            abort_request = abort_requests_rx.next() => {
-                if let Some(seq_id) = abort_request {
-                    if let Some(abort_tx) = server_tasks.remove(&seq_id) {
-                        /* this causes S::execute to terminate with None */
-                        let _ = abort_tx.send(());
-                    }
-                }
+    
+    pub async fn build(self) -> (Client<C>, Server) {
+        let Builder { server: server::Some(server_impl), interface, .. } = self;
+        let (client_requests_tx, client_requests_rx) = mpsc::unbounded();
+        let (client_responses_tx, client_responses_rx) = mpsc::unbounded();
+        
+        let (server_requests_tx, server_requests_rx) = mpsc::unbounded();
+        let (abort_requests_tx, abort_requests_rx) = mpsc::unbounded();
+        
+        interface.pre_attach().await;
+        let listener = EventListener::new(interface.as_ref(), "message", move |event| {
+            let array = event.unchecked_ref::<MessageEvent>()
+                .data()
+                .dyn_into::<Array>()
+                .unwrap();
+            let message = Uint8Array::new(&array.shift().dyn_into::<ArrayBuffer>().unwrap())
+                .to_vec();
+            match bincode::deserialize::<Message<S::Request, C::Response>>(&message).unwrap() {
+                Message::Response(seq_id, response) =>
+                    client_responses_tx.unbounded_send((seq_id, response, array)).unwrap(),
+                Message::Request(seq_id, request) =>
+                    server_requests_tx.unbounded_send((seq_id, request, array)).unwrap(),
+                Message::Abort(seq_id) =>
+                    abort_requests_tx.unbounded_send(seq_id).unwrap(),
             }
-            server_response = server_responses_rx.next() => {
-                if let Some((seq_id, response)) = server_response {
-                    if server_tasks.remove(&seq_id).is_some() {
-                        if let Some((response, post_args, transfer_args)) = response {
-                            let response = Message::<C::Request, S::Response>::Response(seq_id, response);
-                            let response = bincode::serialize(&response).unwrap();
-                            let buffer = Uint8Array::from(&response[..]).buffer();
-                            post_args.unshift(&buffer);
-                            transfer_args.unshift(&buffer);
-                            interface.post_message(&post_args, &transfer_args).unwrap();
-                        }
-                    }
-                }
-            },
-
-            // CLIENT SIDE LOGIC
-            client_request = client_requests_rx.next() => {
-                if let Some((request, post_args, transfer_args, response_tx, abort_rx)) = client_request {
-                    let seq_id = last_seq_id;
-                    last_seq_id = last_seq_id.wrapping_add(1);
-                    /* abort_rx will complete once RequestFuture is dropped */
-                    abort_requests.push(abort_rx.map(move |_| seq_id));
-                    client_tasks.insert(seq_id, response_tx);
-                    let request = Message::<C::Request, S::Response>::Request(seq_id, request);
-                    let request = bincode::serialize(&request).unwrap();
-                    let buffer = js_sys::Uint8Array::from(&request[..]).buffer();
-                    post_args.unshift(&buffer);
-                    transfer_args.unshift(&buffer);
-                    interface.post_message(&post_args, &transfer_args).unwrap();
-                }
-            },
-            abort_request = abort_requests.next() => {
-                if let Some(seq_id) = abort_request {
-                    if client_tasks.remove(&seq_id).is_some() {
-                        let abort_request = Message::<C::Request, S::Response>::Abort(seq_id);
-                        let abort_request = bincode::serialize(&abort_request).unwrap();
-                        let buffer = js_sys::Uint8Array::from(&abort_request[..]).buffer();
-                        let post_args = js_sys::Array::of1(&buffer);
-                        let transfer_args = js_sys::Array::of1(&buffer);
-                        interface.post_message(&post_args, &transfer_args).unwrap();
-                    }
-                }
-            },
-            client_response = client_responses_rx.next() => {
-                let (seq_id, response, js_args) = client_response.unwrap();
-                if let Some(client_task) = client_tasks.remove(&seq_id) {
-                    let _ = client_task.send((response, js_args));
-                }
-            }
-        }
-    }
-}
-
-pub trait SendRecv {
-    fn event_target(&self) -> &web_sys::EventTarget;
-    fn post_message(
-        &self,
-        message: &JsValue,
-        transfer: &JsValue
-    ) -> std::result::Result<(), JsValue>;
-    fn pre_attach(&self) -> impl Future<Output = ()> { async {} }
-    fn post_attach(&self) -> impl Future<Output = ()> { async {} }
-}
-
-impl SendRecv for web_sys::DedicatedWorkerGlobalScope {
-    fn event_target(&self) -> &web_sys::EventTarget {
-        self.as_ref()
-    }
-    fn post_message(
-        &self,
-        message: &JsValue,
-        transfer: &JsValue
-    ) -> std::result::Result<(), JsValue> {
-        self.post_message_with_transfer(message, transfer)
-    }
-    async fn post_attach(&self) {
-        /* indicate that this worker is ready to receive messages */
-        self.post_message(&JsValue::UNDEFINED).unwrap();
-    }
-}
-
-impl SendRecv for web_sys::Worker {
-    fn event_target(&self) -> &web_sys::EventTarget {
-        self.as_ref()
-    }
-    fn post_message(
-        &self,
-        message: &JsValue,
-        transfer: &JsValue
-    ) -> std::result::Result<(), JsValue> {
-        self.post_message_with_transfer(message, transfer)
-    }
-    async fn pre_attach(&self) {
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let _ready_listener = EventListener::once(self.event_target(), "message", move |_| {
-            ready_tx.send(()).unwrap();
         });
-        ready_rx.await.unwrap();
-    }
-}
+        interface.post_attach().await;
+        let listener = Rc::new(listener);
+        
+        // WORK IN PROGRESS: do not rely on task so that messages can be sync
+        let temp_client_task = client::task::<C, I, S::Response>(
+            interface.clone(),
+            client_requests_rx,
+            client_responses_rx
+        );
+        wasm_bindgen_futures::spawn_local(temp_client_task);
+        // WORK IN PROGRESS: do not rely on task so that messages can be sync
 
-impl SendRecv for web_sys::MessagePort {
-    fn event_target(&self) -> &web_sys::EventTarget {
-        self.as_ref()
-    }
-    fn post_message(
-        &self,
-        message: &JsValue,
-        transfer: &JsValue
-    ) -> std::result::Result<(), JsValue> {
-        self.post_message_with_transferable(message, transfer)
-    }
-    async fn post_attach(&self) {
-        self.start();
+        let client = Client {
+            listener: listener.clone(),
+            last_seq_id: Default::default(),
+            client_impl: C::from(client_requests_tx)
+        };
+
+        let server = Server {
+            listener,
+            task: server::task::<S, I, C::Request>(
+                server_impl,
+                interface,
+                server_requests_rx,
+                abort_requests_rx
+            ).boxed_local()
+        };
+
+        (client, server)
     }
 }

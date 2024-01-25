@@ -26,6 +26,7 @@ wasm-bindgen = "0.2.87"
 web-sys = { version = "0.3", features = ["Worker", "DedicatedWorkerGlobalScope", "MessagePort", "EventTarget", "MessageEvent"] }
 
 [dev-dependencies]
+console_error_panic_hook = "0.1.7"
 gloo-timers = { version = "0.3", features = ["futures"] }
 wasm-bindgen-test = "0.3.0"
 web-sys = { version = "0.3", features = ["MessagePort", "MessageChannel"] }
