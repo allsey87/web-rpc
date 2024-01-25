@@ -1,7 +1,7 @@
 use futures_util::FutureExt;
 use wasm_bindgen_test::*;
 
-#[worker_rpc::service]
+#[web_rpc::service]
 pub trait Service {
     #[post(left, right, return)]
     fn concat_with_space(
@@ -26,13 +26,13 @@ async fn post() {
     /* create channel */
     let channel = web_sys::MessageChannel::new().unwrap();
     /* create and spawn server (shuts down when _server_handle is dropped) */
-    let (server, _server_handle) = worker_rpc::Builder::new(channel.port1())
+    let (server, _server_handle) = web_rpc::Builder::new(channel.port1())
         .with_server(ServiceServer::new(ServiceServerImpl))
         .build().await
         .remote_handle();
     wasm_bindgen_futures::spawn_local(server);
     /* create client */
-    let client = worker_rpc::Builder::new(channel.port2())
+    let client = web_rpc::Builder::new(channel.port2())
         .with_client::<ServiceClient>()
         .build().await;
     /* run test */

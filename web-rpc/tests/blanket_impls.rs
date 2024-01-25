@@ -3,7 +3,7 @@ use std::time::Duration;
 use futures_util::FutureExt;
 use wasm_bindgen_test::*;
 
-#[worker_rpc::service]
+#[web_rpc::service]
 pub trait Service {
     async fn sleep(duration: Duration);
 }
@@ -14,18 +14,18 @@ impl Service for ServiceServerImpl {
     }
 }
 
-async fn test_banket_impl<S: Service + 'static>(server_impl: S) -> worker_rpc::Result<()> {
+async fn test_banket_impl<S: Service + 'static>(server_impl: S) -> web_rpc::Result<()> {
     console_error_panic_hook::set_once();
     /* create channel */
     let channel = web_sys::MessageChannel::new().unwrap();
     /* create and spawn server (shuts down when _server_handle is dropped) */
-    let (server, _server_handle) = worker_rpc::Builder::new(channel.port1())
+    let (server, _server_handle) = web_rpc::Builder::new(channel.port1())
         .with_server(ServiceServer::new(server_impl))
         .build().await
         .remote_handle();
     wasm_bindgen_futures::spawn_local(server);
     /* create client */
-    let client = worker_rpc::Builder::new(channel.port2())
+    let client = web_rpc::Builder::new(channel.port2())
         .with_client::<ServiceClient>()
         .build().await;
     client.sleep(Duration::default()).await

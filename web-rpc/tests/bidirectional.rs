@@ -2,7 +2,7 @@ use futures_util::{future::join, FutureExt};
 use wasm_bindgen_test::*;
 
 /* define the service */
-#[worker_rpc::service]
+#[web_rpc::service]
 pub trait Service {
     fn add(left: u32, right: u32) -> u32;
 }
@@ -26,12 +26,12 @@ async fn bidirectional() {
     /* create channel */
     let channel = web_sys::MessageChannel::new().unwrap();
     /* create server1 and client1 */
-    let (client1, server1) = worker_rpc::Builder::new(channel.port1())
+    let (client1, server1) = web_rpc::Builder::new(channel.port1())
         .with_server(ServiceServer::new(ServiceServerImpl))
         .with_client::<ServiceClient>()
         .build().await;
     /* create server2 and client2 */
-    let (client2, server2) = worker_rpc::Builder::new(channel.port2())
+    let (client2, server2) = web_rpc::Builder::new(channel.port2())
         .with_server(ServiceServer::new(ServiceServerImpl))
         .with_client::<ServiceClient>()
         .build().await;

@@ -1,5 +1,5 @@
 [package]
-name = "worker-rpc-macro"
+name = "web-rpc-macro"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

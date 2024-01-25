@@ -9,7 +9,7 @@ use serde::{Serialize, Deserialize};
 use wasm_bindgen::JsCast;
 use web_sys::MessageEvent;
 
-pub use worker_rpc_macro::service;
+pub use web_rpc_macro::service;
 pub use futures_channel;
 pub use futures_util;
 pub use serde;

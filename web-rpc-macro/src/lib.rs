@@ -71,7 +71,7 @@ impl<'a> ServiceGenerator<'a> {
                 }
             });
         quote! {
-            #[derive(worker_rpc::serde::Serialize, worker_rpc::serde::Deserialize)]
+            #[derive(web_rpc::serde::Serialize, web_rpc::serde::Deserialize)]
             #vis enum #request_ident {
                 #( #variants ),*
             }
@@ -96,7 +96,7 @@ impl<'a> ServiceGenerator<'a> {
                 },
             });
         quote! {
-            #[derive(worker_rpc::serde::Serialize, worker_rpc::serde::Deserialize)]
+            #[derive(web_rpc::serde::Serialize, web_rpc::serde::Deserialize)]
             #vis enum #response_ident {
                 #( #variants ),*
             }
@@ -212,7 +212,7 @@ impl<'a> ServiceGenerator<'a> {
                 let unpack_response = if post.contains(&Ident::new("return", output.span())) {
                     quote! {
                         let (_, __post_response) = response;
-                        worker_rpc::wasm_bindgen::JsCast::dyn_into::<#output>(__post_response.shift())
+                        web_rpc::wasm_bindgen::JsCast::dyn_into::<#output>(__post_response.shift())
                             .unwrap()
                     }
                 } else {
@@ -230,28 +230,28 @@ impl<'a> ServiceGenerator<'a> {
                     #vis fn #ident(
                         &self,
                         #( #args ),*
-                    ) -> worker_rpc::client::RequestFuture<worker_rpc::Result<#output>> {
+                    ) -> web_rpc::client::RequestFuture<web_rpc::Result<#output>> {
                         let __request = #request_ident::#camel_case_ident {
                             #( #serialize_arg_idents ),*
                         };
                         let __post: &[&wasm_bindgen::JsValue] = &[#( #post_arg_idents.as_ref() ),*];
-                        let __post = worker_rpc::js_sys::Array::from_iter(__post);
+                        let __post = web_rpc::js_sys::Array::from_iter(__post);
                         let __transfer: &[&wasm_bindgen::JsValue] = &[#( #transfer_arg_idents.as_ref() ),*];
-                        let __transfer = worker_rpc::js_sys::Array::from_iter(__transfer);
+                        let __transfer = web_rpc::js_sys::Array::from_iter(__transfer);
 
-                        let (__cancel_tx, __cancel_rx) = worker_rpc::futures_channel::oneshot::channel();
-                        let (__response_tx, __response_rx) = worker_rpc::futures_channel::oneshot::channel();
+                        let (__cancel_tx, __cancel_rx) = web_rpc::futures_channel::oneshot::channel();
+                        let (__response_tx, __response_rx) = web_rpc::futures_channel::oneshot::channel();
                         self.tx.unbounded_send((__request, __post, __transfer, __response_tx, __cancel_rx)).unwrap();
 
                         let __response_rx =
-                            worker_rpc::futures_util::TryFutureExt::map_err(__response_rx, |_| {
-                                worker_rpc::Error::Aborted
+                            web_rpc::futures_util::TryFutureExt::map_err(__response_rx, |_| {
+                                web_rpc::Error::Aborted
                             });
                         let __response_rx =
-                            worker_rpc::futures_util::TryFutureExt::map_ok(__response_rx, |response| {
+                            web_rpc::futures_util::TryFutureExt::map_ok(__response_rx, |response| {
                                 #unpack_response
                             });
-                        worker_rpc::client::RequestFuture::new(__response_rx, __cancel_tx)
+                        web_rpc::client::RequestFuture::new(__response_rx, __cancel_tx)
                     }
                 }
             });
@@ -259,14 +259,14 @@ impl<'a> ServiceGenerator<'a> {
         quote! {
             #[derive(core::clone::Clone)]
             #vis struct #client_ident {
-                tx: worker_rpc::client::RequestSender<#client_ident>
+                tx: web_rpc::client::RequestSender<#client_ident>
             }
-            impl worker_rpc::client::Client for #client_ident {
+            impl web_rpc::client::Client for #client_ident {
                 type Request = #request_ident;
                 type Response = #response_ident;
             }
-            impl From<worker_rpc::client::RequestSender<#client_ident>> for #client_ident {
-                fn from(tx: worker_rpc::client::RequestSender<#client_ident>) -> Self {
+            impl From<web_rpc::client::RequestSender<#client_ident>> for #client_ident {
+                fn from(tx: web_rpc::client::RequestSender<#client_ident>) -> Self {
                     Self { tx }
                 }
             }
@@ -302,7 +302,7 @@ impl<'a> ServiceGenerator<'a> {
                             let arg_pat = &arg.pat;
                             let arg_ty = &arg.ty;
                             Some(quote! {
-                                let #arg_pat = worker_rpc::wasm_bindgen::JsCast::dyn_into::<#arg_ty>(__js_args.shift())
+                                let #arg_pat = web_rpc::wasm_bindgen::JsCast::dyn_into::<#arg_ty>(__js_args.shift())
                                     .unwrap();
                             })
                         },
@@ -311,18 +311,18 @@ impl<'a> ServiceGenerator<'a> {
                 let return_ident = Ident::new("return", output.span());
                 let return_response = match (post.contains(&return_ident), transfer.contains(&return_ident)) {
                     (false, _) => quote! {
-                        let __post = worker_rpc::js_sys::Array::new();
-                        let __transfer = worker_rpc::js_sys::Array::new();
+                        let __post = web_rpc::js_sys::Array::new();
+                        let __transfer = web_rpc::js_sys::Array::new();
                         (Self::Response::#camel_case_ident(__response), __post, __transfer)
                     },
                     (true, false) => quote! {
-                        let __post = worker_rpc::js_sys::Array::of1(__response.as_ref());
-                        let __transfer = worker_rpc::js_sys::Array::new();
+                        let __post = web_rpc::js_sys::Array::of1(__response.as_ref());
+                        let __transfer = web_rpc::js_sys::Array::new();
                         (Self::Response::#camel_case_ident(()), __post, __transfer)
                     },
                     (true, true) => quote! {
-                        let __post = worker_rpc::js_sys::Array::of1(__response.as_ref());
-                        let __transfer = worker_rpc::js_sys::Array::of1(__response.as_ref());
+                        let __post = web_rpc::js_sys::Array::of1(__response.as_ref());
+                        let __transfer = web_rpc::js_sys::Array::of1(__response.as_ref());
                         (Self::Response::#camel_case_ident(()), __post, __transfer)
                     }
                 };
@@ -335,9 +335,9 @@ impl<'a> ServiceGenerator<'a> {
                         Self::Request::#camel_case_ident { #( #serialize_arg_idents ),* } => {
                             #( #extract_js_args )*
                             let __task =
-                                worker_rpc::futures_util::FutureExt::fuse(self.server_impl.#ident(#( #args ),*));
-                            worker_rpc::pin_utils::pin_mut!(__task);
-                            worker_rpc::futures_util::select! {
+                                web_rpc::futures_util::FutureExt::fuse(self.server_impl.#ident(#( #args ),*));
+                            web_rpc::pin_utils::pin_mut!(__task);
+                            web_rpc::futures_util::select! {
                                 _ = __cancel_rx => None,
                                 __response = __task => Some({
                                     #return_response
@@ -361,16 +361,16 @@ impl<'a> ServiceGenerator<'a> {
             #vis struct #server_ident<I> {
                 server_impl: I
             }
-            impl<I: #service_ident> worker_rpc::server::Server for #server_ident<I> {
+            impl<I: #service_ident> web_rpc::server::Server for #server_ident<I> {
                 type Request = #request_ident;
                 type Response = #response_ident;
                 async fn execute(
                     &self,
                     __seq_id: u32,
-                    mut __cancel_rx: worker_rpc::futures_channel::oneshot::Receiver<()>,
+                    mut __cancel_rx: web_rpc::futures_channel::oneshot::Receiver<()>,
                     __request: Self::Request,
-                    __js_args: worker_rpc::js_sys::Array
-                ) -> (u32, Option<(Self::Response, worker_rpc::js_sys::Array, worker_rpc::js_sys::Array)>) {
+                    __js_args: web_rpc::js_sys::Array
+                ) -> (u32, Option<(Self::Response, web_rpc::js_sys::Array, web_rpc::js_sys::Array)>) {
                     let __result = match __request {
                         #( #handlers )*
                     };
