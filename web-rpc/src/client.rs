@@ -6,23 +6,12 @@ use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
 use js_sys::Array;
 use serde::{de::DeserializeOwned, Serialize};
 
-pub trait Client {
-    type Request: DeserializeOwned + Serialize;
-    type Response: DeserializeOwned + Serialize;
-}
-
 pub struct None;
 pub struct Some<C>(pub C);
 
-impl Client for None {
-    type Request = ();
-    type Response = ();
-}
-
-impl From<RequestSender<None>> for None {
-    fn from(_: RequestSender<None>) -> Self {
-        Self
-    }
+pub trait Client {
+    type Request: DeserializeOwned + Serialize;
+    type Response: DeserializeOwned + Serialize;
 }
 
 pub type RequestSender<C> = mpsc::UnboundedSender<(
