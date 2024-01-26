@@ -42,8 +42,8 @@ struct RpcMethod {
 }
 
 struct ServiceGenerator<'a> {
+    trait_ident: &'a Ident,
     service_ident: &'a Ident,
-    server_ident: &'a Ident,
     client_ident: &'a Ident,
     request_ident: &'a Ident,
     response_ident: &'a Ident,
@@ -108,7 +108,7 @@ impl<'a> ServiceGenerator<'a> {
             attrs,
             rpcs,
             vis,
-            service_ident,
+            trait_ident,
             ..
         } = self;
 
@@ -158,17 +158,17 @@ impl<'a> ServiceGenerator<'a> {
 
         quote! {
             #( #attrs )*
-            #vis trait #service_ident {
+            #vis trait #trait_ident {
                 #( #rpc_fns )*
             }
 
-            impl<T> #service_ident for std::sync::Arc<T> where T: #service_ident {
+            impl<T> #trait_ident for std::sync::Arc<T> where T: #trait_ident {
                 #( #forward_fns )*
             }
-            impl<T> #service_ident for std::boxed::Box<T> where T: #service_ident {
+            impl<T> #trait_ident for std::boxed::Box<T> where T: #trait_ident {
                 #( #forward_fns )*
             }
-            impl<T> #service_ident for std::rc::Rc<T> where T: #service_ident {
+            impl<T> #trait_ident for std::rc::Rc<T> where T: #trait_ident {
                 #( #forward_fns )*
             }
         }
@@ -185,15 +185,11 @@ impl<'a> ServiceGenerator<'a> {
             ..
         } = self;
 
-        let unit_type: &Type = &parse_quote!(());
         let rpc_fns = rpcs
             .iter()
             .zip(camel_case_idents.iter())
             .map(|(RpcMethod { attrs, args, transfer, post, ident, output, .. }, camel_case_ident)| {
-                let output = match output {
-                    ReturnType::Type(_, ref ty) => ty,
-                    ReturnType::Default => unit_type
-                };
+                /* sort arguments based on post and transfer attributes */
                 let serialize_arg_idents = args.iter()
                     .filter_map(|arg| match &*arg.pat {
                         Pat::Ident(ident) if !post.contains(&ident.ident) => Some(&ident.ident),
@@ -209,7 +205,28 @@ impl<'a> ServiceGenerator<'a> {
                         Pat::Ident(ident) if transfer.contains(&ident.ident) => Some(&ident.ident),
                         _ => None
                     });
+
+                let return_type = match output {
+                    ReturnType::Type(_, ref ty) => quote! {
+                        web_rpc::client::RequestFuture<#ty>
+                    },
+                    _ => quote!(())
+                };
+                let maybe_register_callback = match output {
+                    ReturnType::Type(_, _) => quote! {
+                        let (__response_tx, __response_rx) =
+                            web_rpc::futures_channel::oneshot::channel();
+                        self.callback_map.borrow_mut().insert(__seq_id, __response_tx);
+                    },
+                    _ => Default::default()
+                };
+
                 let unpack_response = if post.contains(&Ident::new("return", output.span())) {
+                    let unit_output: &Type = &parse_quote!(());
+                    let output = match output {
+                        ReturnType::Type(_, ref ty) => ty,
+                        _ => unit_output
+                    };
                     quote! {
                         let (_, __post_response) = response;
                         web_rpc::wasm_bindgen::JsCast::dyn_into::<#output>(__post_response.shift())
@@ -225,33 +242,44 @@ impl<'a> ServiceGenerator<'a> {
                     }
                 };
 
+                let maybe_unpack_and_return_future = match output {
+                    ReturnType::Type(_, _) => quote! {
+                        let __response_future = web_rpc::futures_util::FutureExt::map(
+                            __response_rx,
+                            |response| {
+                                let response = response.unwrap();
+                                #unpack_response
+                            }
+                        );
+                        let __abort_sender = self.abort_sender.clone();
+                        web_rpc::client::RequestFuture::new(
+                            __response_future,
+                            std::boxed::Box::new(move || (__abort_sender)(__seq_id)))
+                    },
+                    _ => Default::default()
+                };
+
                 quote! {
                     #( #attrs )*
                     #vis fn #ident(
                         &self,
                         #( #args ),*
-                    ) -> web_rpc::client::RequestFuture<web_rpc::Result<#output>> {
+                    ) -> #return_type {
+                        let __seq_id = self.seq_id.replace_with(|seq_id| seq_id.wrapping_add(1));
                         let __request = #request_ident::#camel_case_ident {
                             #( #serialize_arg_idents ),*
                         };
-                        let __post: &[&wasm_bindgen::JsValue] = &[#( #post_arg_idents.as_ref() ),*];
+                        let __serialized = (self.request_serializer)(__seq_id, __request);
+                        let __serialized = js_sys::Uint8Array::from(&__serialized[..]).buffer();
+                        let __post: &[&wasm_bindgen::JsValue] =
+                            &[__serialized.as_ref(), #( #post_arg_idents.as_ref() ),*];
                         let __post = web_rpc::js_sys::Array::from_iter(__post);
-                        let __transfer: &[&wasm_bindgen::JsValue] = &[#( #transfer_arg_idents.as_ref() ),*];
+                        let __transfer: &[&wasm_bindgen::JsValue] =
+                            &[__serialized.as_ref(), #( #transfer_arg_idents.as_ref() ),*];
                         let __transfer = web_rpc::js_sys::Array::from_iter(__transfer);
-
-                        let (__cancel_tx, __cancel_rx) = web_rpc::futures_channel::oneshot::channel();
-                        let (__response_tx, __response_rx) = web_rpc::futures_channel::oneshot::channel();
-                        self.tx.unbounded_send((__request, __post, __transfer, __response_tx, __cancel_rx)).unwrap();
-
-                        let __response_rx =
-                            web_rpc::futures_util::TryFutureExt::map_err(__response_rx, |_| {
-                                web_rpc::Error::Aborted
-                            });
-                        let __response_rx =
-                            web_rpc::futures_util::TryFutureExt::map_ok(__response_rx, |response| {
-                                #unpack_response
-                            });
-                        web_rpc::client::RequestFuture::new(__response_rx, __cancel_tx)
+                        #maybe_register_callback
+                        self.interface.post_message(&__post, &__transfer).unwrap();
+                        #maybe_unpack_and_return_future
                     }
                 }
             });
@@ -259,15 +287,37 @@ impl<'a> ServiceGenerator<'a> {
         quote! {
             #[derive(core::clone::Clone)]
             #vis struct #client_ident {
-                tx: web_rpc::client::RequestSender<#client_ident>
+                callback_map: std::rc::Rc<
+                    std::cell::RefCell<
+                        web_rpc::client::CallbackMap<#response_ident>
+                    >
+                >,
+                interface: std::rc::Rc<
+                    dyn web_rpc::interface::Interface + std::marker::Unpin
+                >,
+                listener: std::rc::Rc<web_rpc::gloo_events::EventListener>,
+                request_serializer: std::rc::Rc<
+                    dyn std::ops::Fn(usize, #request_ident) -> std::vec::Vec<u8>
+                >,
+                abort_sender: std::rc::Rc<dyn std::ops::Fn(usize)>,
+                seq_id: std::rc::Rc<std::cell::RefCell<usize>>
             }
             impl web_rpc::client::Client for #client_ident {
                 type Request = #request_ident;
                 type Response = #response_ident;
             }
-            impl From<web_rpc::client::RequestSender<#client_ident>> for #client_ident {
-                fn from(tx: web_rpc::client::RequestSender<#client_ident>) -> Self {
-                    Self { tx }
+            impl<I> From<web_rpc::client::Configuration<#request_ident, #response_ident, I>>
+                for #client_ident where I: web_rpc::interface::Interface + std::marker::Unpin + 'static {
+                fn from((callback_map, interface, listener, request_serializer, abort_sender):
+                    web_rpc::client::Configuration<#request_ident, #response_ident, I>) -> Self {
+                    Self {
+                        callback_map,
+                        interface,
+                        listener,
+                        request_serializer,
+                        abort_sender,
+                        seq_id: std::default::Default::default()
+                    }
                 }
             }
             impl #client_ident {
@@ -279,8 +329,8 @@ impl<'a> ServiceGenerator<'a> {
     fn struct_server(&self) -> TokenStream2 {
         let &Self {
             vis,
+            trait_ident,
             service_ident,
-            server_ident,
             request_ident,
             response_ident,
             camel_case_idents,
@@ -358,26 +408,26 @@ impl<'a> ServiceGenerator<'a> {
             });
 
         quote! {
-            #vis struct #server_ident<I> {
+            #vis struct #service_ident<I> {
                 server_impl: I
             }
-            impl<I: #service_ident> web_rpc::server::Server for #server_ident<I> {
+            impl<I: #trait_ident> web_rpc::service::Service for #service_ident<I> {
                 type Request = #request_ident;
                 type Response = #response_ident;
                 async fn execute(
                     &self,
-                    __seq_id: u32,
+                    __seq_id: usize,
                     mut __cancel_rx: web_rpc::futures_channel::oneshot::Receiver<()>,
                     __request: Self::Request,
                     __js_args: web_rpc::js_sys::Array
-                ) -> (u32, Option<(Self::Response, web_rpc::js_sys::Array, web_rpc::js_sys::Array)>) {
+                ) -> (usize, Option<(Self::Response, web_rpc::js_sys::Array, web_rpc::js_sys::Array)>) {
                     let __result = match __request {
                         #( #handlers )*
                     };
                     (__seq_id, __result)
                 }
             }
-            impl<T: #service_ident> #server_ident<T> {
+            impl<T: #trait_ident> #service_ident<T> {
                 #vis fn new(server_impl: T) -> Self {
                     Self { server_impl }
                 }
@@ -540,8 +590,8 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
 
 
     ServiceGenerator {
-        service_ident: ident,
-        server_ident: &format_ident!("{}Server", ident),
+        trait_ident: ident,
+        service_ident: &format_ident!("{}Service", ident),
         client_ident: &format_ident!("{}Client", ident),
         request_ident: &format_ident!("{}Request", ident),
         response_ident: &format_ident!("{}Response", ident),

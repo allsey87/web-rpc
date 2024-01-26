@@ -4,34 +4,34 @@ use futures_util::{future::RemoteHandle, FutureExt};
 use wasm_bindgen_test::*;
 
 #[web_rpc::service]
-pub trait FortyTwoService {
+pub trait FortyTwo {
     fn forty_two() -> u32;
 }
 struct FortyTwoServiceImpl;
-impl FortyTwoService for FortyTwoServiceImpl {
+impl FortyTwo for FortyTwoServiceImpl {
     fn forty_two(&self) -> u32 {
         42
     }
 }
 
 #[web_rpc::service]
-pub trait Service {
+pub trait Channel {
     #[post(transfer(return))]
     async fn start() -> web_sys::MessagePort;
 }
 
 #[derive(Default)]
-struct ServiceServerImpl {
+struct ChannelServiceImpl {
     server_handle: OnceLock<RemoteHandle<()>>
 }
 
-impl Service for ServiceServerImpl {
+impl Channel for ChannelServiceImpl {
     async fn start(&self) -> web_sys::MessagePort {
         /* create channel */
         let channel = web_sys::MessageChannel::new().unwrap();
         /* create and spawn server (shuts down when server_handle is dropped) */
         let (server, server_handle) = web_rpc::Builder::new(channel.port1())
-            .with_server(FortyTwoServiceServer::new(FortyTwoServiceImpl))
+            .with_service(FortyTwoService::new(FortyTwoServiceImpl))
             .build().await
             .remote_handle();
         wasm_bindgen_futures::spawn_local(server);
@@ -51,19 +51,19 @@ async fn inception() {
     let channel = web_sys::MessageChannel::new().unwrap();
     /* create and spawn server (shuts down when _server_handle is dropped) */
     let (server, _server_handle) = web_rpc::Builder::new(channel.port1())
-        .with_server(ServiceServer::new(ServiceServerImpl::default()))
+        .with_service(ChannelService::new(ChannelServiceImpl::default()))
         .build().await
         .remote_handle();
     wasm_bindgen_futures::spawn_local(server);
     /* create client */
     let client = web_rpc::Builder::new(channel.port2())
-        .with_client::<ServiceClient>()
+        .with_client::<ChannelClient>()
         .build().await;
     /* run test */
-    let port3 = client.start().await.expect("RPC failure");
+    let port3 = client.start().await;
     let client = web_rpc::Builder::new(port3)
-        .with_client::<FortyTwoServiceClient>()
+        .with_client::<FortyTwoClient>()
         .build().await;
-    assert_eq!(client.forty_two().await.expect("RPC failure"), 42);
+    assert_eq!(client.forty_two().await, 42);
 }
 

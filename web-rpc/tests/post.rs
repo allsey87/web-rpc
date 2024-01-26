@@ -2,15 +2,15 @@ use futures_util::FutureExt;
 use wasm_bindgen_test::*;
 
 #[web_rpc::service]
-pub trait Service {
+pub trait Concat {
     #[post(left, right, return)]
     fn concat_with_space(
         left: js_sys::JsString,
         right: js_sys::JsString
     ) -> js_sys::JsString;
 }
-struct ServiceServerImpl;
-impl Service for ServiceServerImpl {
+struct ConcatServiceImpl;
+impl Concat for ConcatServiceImpl {
     fn concat_with_space(
         &self,
         left: js_sys::JsString,
@@ -27,16 +27,15 @@ async fn post() {
     let channel = web_sys::MessageChannel::new().unwrap();
     /* create and spawn server (shuts down when _server_handle is dropped) */
     let (server, _server_handle) = web_rpc::Builder::new(channel.port1())
-        .with_server(ServiceServer::new(ServiceServerImpl))
+        .with_service(ConcatService::new(ConcatServiceImpl))
         .build().await
         .remote_handle();
     wasm_bindgen_futures::spawn_local(server);
     /* create client */
     let client = web_rpc::Builder::new(channel.port2())
-        .with_client::<ServiceClient>()
+        .with_client::<ConcatClient>()
         .build().await;
     /* run test */
-    let response = client.concat_with_space("hello".into(), "world".into()).await
-        .expect("RPC failure");
+    let response = client.concat_with_space("hello".into(), "world".into()).await;
     assert_eq!(response, "hello world");
 }
