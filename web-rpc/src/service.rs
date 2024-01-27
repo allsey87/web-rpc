@@ -3,11 +3,11 @@ use std::{collections::HashMap, rc::Rc};
 use futures_channel::{mpsc, oneshot};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use js_sys::{Array, Uint8Array};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::Serialize;
 
 pub trait Service {
-    type Request: DeserializeOwned + Serialize;
-    type Response: DeserializeOwned + Serialize;
+    type Request;
+    type Response;
 
     fn execute(
         &self,
@@ -26,7 +26,8 @@ pub(crate) async fn task<S, I, R>(
 ) where
     S: Service + 'static,
     I: crate::interface::Interface + 'static,
-    R: Serialize {
+    R: Serialize,
+    <S as Service>::Response: Serialize {
     let mut server_tasks: HashMap<usize, oneshot::Sender<_>> = Default::default();
     let mut server_responses_rx: FuturesUnordered<_> = Default::default();
     loop {

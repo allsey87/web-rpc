@@ -3,11 +3,10 @@ use std::{cell::RefCell, collections::HashMap, pin::Pin, rc::Rc, task::{Context,
 use futures_channel::oneshot;
 use futures_core::{future::LocalBoxFuture, Future};
 use futures_util::FutureExt;
-use serde::{de::DeserializeOwned, Serialize};
 
 pub trait Client {
-    type Request: DeserializeOwned + Serialize;
-    type Response: DeserializeOwned + Serialize;
+    type Request;
+    type Response;
 }
 
 pub type CallbackMap<Response> = HashMap<

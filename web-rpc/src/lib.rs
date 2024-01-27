@@ -5,7 +5,7 @@ use futures_core::{future::LocalBoxFuture, Future};
 use futures_util::FutureExt;
 use gloo_events::EventListener;
 use js_sys::{Uint8Array, Array, ArrayBuffer};
-use serde::{Serialize, Deserialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use wasm_bindgen::JsCast;
 use web_sys::MessageEvent;
 
@@ -85,7 +85,8 @@ impl Future for Server {
 impl<C, I> Builder<C, (), I> where
     C: client::Client + From<client::Configuration<C::Request, C::Response, I>> + 'static,
     I: interface::Interface + 'static,
-    <C as client::Client>::Response: 'static {
+    <C as client::Client>::Response: DeserializeOwned,
+    <C as client::Client>::Request: Serialize {
 
     pub async fn build(self) -> C {
         let Builder { interface, ..} = self;
@@ -136,7 +137,8 @@ impl<C, I> Builder<C, (), I> where
 impl<S, I> Builder<(), S, I> where 
     S: service::Service + 'static,
     I: interface::Interface + 'static,
-    <S as service::Service>::Request: 'static {
+    <S as service::Service>::Request: DeserializeOwned,
+    <S as service::Service>::Response: Serialize {
 
     pub async fn build(self) -> Server {
         let Builder { service: server, interface, .. } = self;
@@ -175,9 +177,10 @@ impl<C, S, I> Builder<C, S, I> where
     C: client::Client + From<client::Configuration<C::Request, C::Response, I>> + 'static,
     S: service::Service + 'static,
     I: interface::Interface + 'static,
-    <S as service::Service>::Request: 'static,
-    <C as client::Client>::Response: 'static {
-    
+    <S as service::Service>::Request: DeserializeOwned,
+    <S as service::Service>::Response: Serialize,
+    <C as client::Client>::Request: Serialize,
+    <C as client::Client>::Response: DeserializeOwned {
     pub async fn build(self) -> (C, Server) {
         let Builder { service: server, interface, .. } = self;
         let client_callback_map: Rc<RefCell<client::CallbackMap<C::Response>>> = Default::default();
