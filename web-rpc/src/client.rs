@@ -22,6 +22,7 @@ pub type Configuration<Request, Response, I> = (
     Rc<dyn Fn(usize)>,
 );
 
+#[must_use = "Either await this future or remove the return type from the RPC method"]
 pub struct RequestFuture<T> {
     result: LocalBoxFuture<'static, T>,
     abort: Pin<Box<RequestAbort>>,
