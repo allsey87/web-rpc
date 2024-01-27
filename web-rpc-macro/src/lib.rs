@@ -293,7 +293,7 @@ impl<'a> ServiceGenerator<'a> {
                     >
                 >,
                 interface: std::rc::Rc<
-                    dyn web_rpc::interface::Interface + std::marker::Unpin
+                    dyn web_rpc::interface::Interface
                 >,
                 listener: std::rc::Rc<web_rpc::gloo_events::EventListener>,
                 request_serializer: std::rc::Rc<
@@ -307,7 +307,7 @@ impl<'a> ServiceGenerator<'a> {
                 type Response = #response_ident;
             }
             impl<I> From<web_rpc::client::Configuration<#request_ident, #response_ident, I>>
-                for #client_ident where I: web_rpc::interface::Interface + std::marker::Unpin + 'static {
+                for #client_ident where I: web_rpc::interface::Interface + 'static {
                 fn from((callback_map, interface, listener, request_serializer, abort_sender):
                     web_rpc::client::Configuration<#request_ident, #response_ident, I>) -> Self {
                     Self {
