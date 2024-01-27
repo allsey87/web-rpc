@@ -20,7 +20,7 @@ async fn test_banket_impl<S: Sleep + 'static>(server_impl: S) {
     let channel = web_sys::MessageChannel::new().unwrap();
     /* create and spawn server (shuts down when _server_handle is dropped) */
     let (server, _server_handle) = web_rpc::Builder::new(channel.port1())
-        .with_service(SleepService::new(server_impl))
+        .with_service::<SleepService<_>>(server_impl)
         .build().await
         .remote_handle();
     wasm_bindgen_futures::spawn_local(server);

@@ -27,7 +27,7 @@ async fn post() {
     let channel = web_sys::MessageChannel::new().unwrap();
     /* create and spawn server (shuts down when _server_handle is dropped) */
     let (server, _server_handle) = web_rpc::Builder::new(channel.port1())
-        .with_service(ConcatService::new(ConcatServiceImpl))
+        .with_service::<ConcatService<_>>(ConcatServiceImpl)
         .build().await
         .remote_handle();
     wasm_bindgen_futures::spawn_local(server);

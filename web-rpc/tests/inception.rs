@@ -31,7 +31,7 @@ impl Channel for ChannelServiceImpl {
         let channel = web_sys::MessageChannel::new().unwrap();
         /* create and spawn server (shuts down when server_handle is dropped) */
         let (server, server_handle) = web_rpc::Builder::new(channel.port1())
-            .with_service(FortyTwoService::new(FortyTwoServiceImpl))
+            .with_service::<FortyTwoService<_>>(FortyTwoServiceImpl)
             .build().await
             .remote_handle();
         wasm_bindgen_futures::spawn_local(server);
@@ -51,7 +51,7 @@ async fn inception() {
     let channel = web_sys::MessageChannel::new().unwrap();
     /* create and spawn server (shuts down when _server_handle is dropped) */
     let (server, _server_handle) = web_rpc::Builder::new(channel.port1())
-        .with_service(ChannelService::new(ChannelServiceImpl::default()))
+        .with_service::<ChannelService<_>>(ChannelServiceImpl::default())
         .build().await
         .remote_handle();
     wasm_bindgen_futures::spawn_local(server);

@@ -388,7 +388,7 @@ impl<'a> ServiceGenerator<'a> {
                                 web_rpc::futures_util::FutureExt::fuse(self.server_impl.#ident(#( #args ),*));
                             web_rpc::pin_utils::pin_mut!(__task);
                             web_rpc::futures_util::select! {
-                                _ = __cancel_rx => None,
+                                _ = __abort_rx => None,
                                 __response = __task => Some({
                                     #return_response
                                 })
@@ -408,16 +408,16 @@ impl<'a> ServiceGenerator<'a> {
             });
 
         quote! {
-            #vis struct #service_ident<I> {
-                server_impl: I
+            #vis struct #service_ident<T> {
+                server_impl: T
             }
-            impl<I: #trait_ident> web_rpc::service::Service for #service_ident<I> {
+            impl<T: #trait_ident> web_rpc::service::Service for #service_ident<T> {
                 type Request = #request_ident;
                 type Response = #response_ident;
                 async fn execute(
                     &self,
                     __seq_id: usize,
-                    mut __cancel_rx: web_rpc::futures_channel::oneshot::Receiver<()>,
+                    mut __abort_rx: web_rpc::futures_channel::oneshot::Receiver<()>,
                     __request: Self::Request,
                     __js_args: web_rpc::js_sys::Array
                 ) -> (usize, Option<(Self::Response, web_rpc::js_sys::Array, web_rpc::js_sys::Array)>) {
@@ -427,8 +427,8 @@ impl<'a> ServiceGenerator<'a> {
                     (__seq_id, __result)
                 }
             }
-            impl<T: #trait_ident> #service_ident<T> {
-                #vis fn new(server_impl: T) -> Self {
+            impl<T: #trait_ident> std::convert::From<T> for #service_ident<T> {
+                fn from(server_impl: T) -> Self {
                     Self { server_impl }
                 }
             }

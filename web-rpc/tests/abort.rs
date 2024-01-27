@@ -29,7 +29,7 @@ async fn abort_via_drop() {
     /* create and spawn server (shuts down when _server_handle is dropped) */
     let service_impl: Arc<CountSlowlyServiceImpl> = Default::default();
     let (server, _server_handle) = web_rpc::Builder::new(channel.port1())
-        .with_service(CountSlowlyService::new(service_impl.clone()))
+        .with_service::<CountSlowlyService<_>>(service_impl.clone())
         .build().await
         .remote_handle();
     wasm_bindgen_futures::spawn_local(server);

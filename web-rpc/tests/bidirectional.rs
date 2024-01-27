@@ -21,12 +21,12 @@ async fn bidirectional() {
     let channel = web_sys::MessageChannel::new().unwrap();
     /* create server1 and client1 */
     let (client1, server1) = web_rpc::Builder::new(channel.port1())
-        .with_service(CalculatorService::new(CalculatorServiceImpl))
+        .with_service::<CalculatorService<_>>(CalculatorServiceImpl)
         .with_client::<CalculatorClient>()
         .build().await;
     /* create server2 and client2 */
     let (client2, server2) = web_rpc::Builder::new(channel.port2())
-        .with_service(CalculatorService::new(CalculatorServiceImpl))
+        .with_service::<CalculatorService<_>>(CalculatorServiceImpl)
         .with_client::<CalculatorClient>()
         .build().await;
     /* spawn the servers */

@@ -49,8 +49,9 @@ pub struct Builder<C, S, I> {
 impl<C, I> Builder<C, (), I> {
     pub fn with_service<S: service::Service>(
         self,
-        service: S
+        implementation: impl Into<S>
     ) -> Builder<C, S, I> {
+        let service = implementation.into();
         let Builder { interface, client, .. } = self;
         Builder { interface, client, service }
     }
