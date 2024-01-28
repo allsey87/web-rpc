@@ -23,16 +23,6 @@ pub mod client;
 pub mod service;
 pub mod interface;
 
-impl<I: interface::Interface> Builder<(), (), I> {
-    pub fn new(interface: I) -> Self {
-        Self {
-            interface,
-            client: PhantomData::<()>,
-            service: (),
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 pub enum Message<Request, Response> {
     Request(usize, Request),
@@ -44,6 +34,16 @@ pub struct Builder<C, S, I> {
     client: PhantomData<C>,
     service: S,
     interface: I,
+}
+
+impl<I: interface::Interface> Builder<(), (), I> {
+    pub fn new(interface: I) -> Self {
+        Self {
+            interface,
+            client: PhantomData::<()>,
+            service: (),
+        }
+    }
 }
 
 impl<C, I> Builder<C, (), I> {
