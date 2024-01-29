@@ -302,6 +302,12 @@ impl<'a> ServiceGenerator<'a> {
                 abort_sender: std::rc::Rc<dyn std::ops::Fn(usize)>,
                 seq_id: std::rc::Rc<std::cell::RefCell<usize>>
             }
+            impl std::fmt::Debug for #client_ident {
+                fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.debug_struct(std::stringify!(#client_ident))
+                        .finish()
+                }
+            }
             impl web_rpc::client::Client for #client_ident {
                 type Request = #request_ident;
                 type Response = #response_ident;
