@@ -252,8 +252,10 @@ impl<'a> ServiceGenerator<'a> {
                             }
                         );
                         let __abort_sender = self.abort_sender.clone();
+                        let __dispatcher = self.dispatcher.clone();
                         web_rpc::client::RequestFuture::new(
                             __response_future,
+                            __dispatcher,
                             std::boxed::Box::new(move || (__abort_sender)(__seq_id)))
                     },
                     _ => Default::default()
@@ -278,7 +280,7 @@ impl<'a> ServiceGenerator<'a> {
                             &[__serialized.as_ref(), #( #transfer_arg_idents.as_ref() ),*];
                         let __transfer = web_rpc::js_sys::Array::from_iter(__transfer);
                         #maybe_register_callback
-                        self.interface.post_message(&__post, &__transfer).unwrap();
+                        self.port.post_message(&__post, &__transfer).unwrap();
                         #maybe_unpack_and_return_future
                     }
                 }
@@ -292,10 +294,13 @@ impl<'a> ServiceGenerator<'a> {
                         web_rpc::client::CallbackMap<#response_ident>
                     >
                 >,
-                interface: std::rc::Rc<
-                    dyn web_rpc::interface::Interface
+                port: std::rc::Rc<
+                    dyn web_rpc::port::Port
                 >,
                 listener: std::rc::Rc<web_rpc::gloo_events::EventListener>,
+                dispatcher: web_rpc::futures_util::future::Shared<
+                    web_rpc::futures_core::future::LocalBoxFuture<'static, ()>
+                >,
                 request_serializer: std::rc::Rc<
                     dyn std::ops::Fn(usize, #request_ident) -> std::vec::Vec<u8>
                 >,
@@ -312,14 +317,15 @@ impl<'a> ServiceGenerator<'a> {
                 type Request = #request_ident;
                 type Response = #response_ident;
             }
-            impl<I> From<web_rpc::client::Configuration<#request_ident, #response_ident, I>>
-                for #client_ident where I: web_rpc::interface::Interface + 'static {
-                fn from((callback_map, interface, listener, request_serializer, abort_sender):
-                    web_rpc::client::Configuration<#request_ident, #response_ident, I>) -> Self {
+            impl<P> From<web_rpc::client::Configuration<#request_ident, #response_ident, P>>
+                for #client_ident where P: web_rpc::port::Port + 'static {
+                fn from((callback_map, port, listener, dispatcher, request_serializer, abort_sender):
+                    web_rpc::client::Configuration<#request_ident, #response_ident, P>) -> Self {
                     Self {
                         callback_map,
-                        interface,
+                        port,
                         listener,
+                        dispatcher,
                         request_serializer,
                         abort_sender,
                         seq_id: std::default::Default::default()

@@ -31,19 +31,25 @@ Note that the version of the trait emitted from the macro adds a `&self` receive
 ```rust
 // create a MessageChannel
 let channel = web_sys::MessageChannel::new();
+// Create two interfaces from the ports. web_rpc::Interface::new is an async method that
+// will return once the other end is ready, hence we need to poll both at the same time
+let (server_interface, client_interface) = futures_util::future::join(
+    web_rpc::Interface::new(channel.port1()),
+    web_rpc::Interface::new(channel.port2()),
+).await;
 // create a server with the first port
-let server = web_rpc::Builder::new(channel.port1())
+let server = web_rpc::Builder::new(server_interface)
     .with_service::<CalculatorService<_>>(CalculatorServiceImpl)
-    .build().await;
+    .build();
 // spawn the server
 wasm_bindgen_futures::spawn_local(server);
 ```
 `web_rpc::Builder::build` is an async method since there is no way to synchronously check whether a channel or a worker is ready to receive messages. To workaround this, temporary listeners are attached to determine when a channel is ready for communication. The output of this method is a future that can be added to the browser's event loop using [`wasm_bindgen_futures::spawn_local`](https://docs.rs/wasm-bindgen-futures/latest/wasm_bindgen_futures/fn.spawn_local.html), however, this will run the server indefinitely. For more control, consider wrapping the server with [`FutureExt::remote_handle`](https://docs.rs/futures/latest/futures/future/trait.FutureExt.html#method.remote_handle) before spawning it, which will shutdown the server once the handle has been dropped. Let's move on the client:
 ```rust
 // create a client using the second port
-let client = web_rpc::Builder::new(channel.port2())
+let client = web_rpc::Builder::new(client_interface)
     .with_client::<CalculatorClient>()
-    .build().await;
+    .build();
 /* call `add` */
 assert_eq!(client.add(41, 1).await, 42);
 ```
@@ -104,16 +110,20 @@ In the original example, we created a server on the first port of the message ch
 ```rust
 /* create channel */
 let channel = web_sys::MessageChannel::new().unwrap();
+let (interface1, interface2) = futures_util::future::join(
+    web_rpc::Interface::new(channel.port1()),
+    web_rpc::Interface::new(channel.port2()),
+).await;
 /* create server1 and client1 */
-let (client1, server1) = web_rpc::Builder::new(channel.port1())
+let (client1, server1) = web_rpc::Builder::new(interface1)
     .with_service::<CalculatorService<_>>(CalculatorServiceImpl)
     .with_client::<CalculatorClient>()
-    .build().await;
+    .build();
 /* create server2 and client2 */
-let (client2, server2) = web_rpc::Builder::new(channel.port2())
+let (client2, server2) = web_rpc::Builder::new(interface2)
     .with_service::<CalculatorService<_>>(CalculatorServiceImpl)
     .with_client::<CalculatorClient>()
-    .build().await;
+    .build();
 ```
 
 

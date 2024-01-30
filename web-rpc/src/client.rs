@@ -2,7 +2,7 @@ use std::{cell::RefCell, collections::HashMap, pin::Pin, rc::Rc, task::{Context,
 
 use futures_channel::oneshot;
 use futures_core::{future::LocalBoxFuture, Future};
-use futures_util::FutureExt;
+use futures_util::{future::{self, Shared}, FutureExt};
 
 pub trait Client {
     type Request;
@@ -14,16 +14,17 @@ pub type CallbackMap<Response> = HashMap<
     oneshot::Sender<(Response, js_sys::Array)>
 >;
 
-pub type Configuration<Request, Response, I> = (
+pub type Configuration<Request, Response, P> = (
     Rc<RefCell<CallbackMap<Response>>>,
-    Rc<I>,
+    Rc<P>,
     Rc<gloo_events::EventListener>,
+    Shared<LocalBoxFuture<'static, ()>>,
     Rc<dyn Fn(usize, Request) -> Vec<u8>>,
     Rc<dyn Fn(usize)>,
 );
 
 #[must_use = "Either await this future or remove the return type from the RPC method"]
-pub struct RequestFuture<T> {
+pub struct RequestFuture<T: 'static> {
     result: LocalBoxFuture<'static, T>,
     abort: Pin<Box<RequestAbort>>,
 }
@@ -31,10 +32,16 @@ pub struct RequestFuture<T> {
 impl<T> RequestFuture<T> {
     pub fn new(
         result: impl Future<Output = T> + 'static,
+        dispatcher: Shared<LocalBoxFuture<'static, ()>>,
         abort: Box<dyn Fn()>,
     ) -> Self {
         Self {
-            result: result.boxed_local(),
+            result: future::select(result.boxed_local(), dispatcher)
+                .map(|select| match select {
+                    future::Either::Left((result, _)) => result,
+                    future::Either::Right(_) => unreachable!("dispatcher should not complete"),
+                })
+                .boxed_local(),
             abort: Box::pin(RequestAbort {
                 active: true,
                 abort

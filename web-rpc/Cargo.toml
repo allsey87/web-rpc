@@ -18,6 +18,7 @@ futures-channel = "0.3.30"
 futures-core = "0.3.30"
 futures-util = { version = "0.3.30", features = ["channel"] }
 gloo-events = "0.2.0"
+gloo-timers =  { version = "0.3", features = ["futures"] }
 js-sys = "0.3.64"
 pin-utils = { version = "0.1.0" }
 serde = { version = "1.0.193", features = ["derive"] }
@@ -27,6 +28,5 @@ web-sys = { version = "0.3", features = ["Worker", "DedicatedWorkerGlobalScope",
 
 [dev-dependencies]
 console_error_panic_hook = "0.1.7"
-gloo-timers = { version = "0.3", features = ["futures"] }
 wasm-bindgen-test = "0.3.0"
 web-sys = { version = "0.3", features = ["MessagePort", "MessageChannel"] }

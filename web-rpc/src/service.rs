@@ -1,8 +1,8 @@
 use std::{collections::HashMap, rc::Rc};
 
 use futures_channel::{mpsc, oneshot};
-use futures_core::Future;
-use futures_util::{stream::FuturesUnordered, StreamExt};
+use futures_core::{future::LocalBoxFuture, Future};
+use futures_util::{future::Shared, stream::FuturesUnordered, StreamExt};
 use js_sys::{Array, Uint8Array};
 use serde::Serialize;
 
@@ -19,20 +19,22 @@ pub trait Service {
     ) -> impl Future<Output = (usize, Option<(Self::Response, Array, Array)>)>;
 }
 
-pub(crate) async fn task<S, I, Request>(
+pub(crate) async fn task<S, P, Request>(
     service: S,
-    interface: Rc<I>,
+    port: Rc<P>,
+    mut dispatcher: Shared<LocalBoxFuture<'static, ()>>,
     mut server_requests_rx: mpsc::UnboundedReceiver<(usize, <S as Service>::Request, js_sys::Array)>,
     mut abort_requests_rx: mpsc::UnboundedReceiver<usize>,
 ) where
     S: Service + 'static,
-    I: crate::interface::Interface + 'static,
+    P: crate::port::Port + 'static,
     Request: Serialize,
     <S as Service>::Response: Serialize {
     let mut server_tasks: HashMap<usize, oneshot::Sender<_>> = Default::default();
     let mut server_responses_rx: FuturesUnordered<_> = Default::default();
     loop {
         futures_util::select! {
+            _ = dispatcher => {}
             server_request = server_requests_rx.next() => {
                 let (seq_id, request, post_args) = server_request.unwrap();
                 let (abort_tx, abort_rx) = oneshot::channel::<()>();
@@ -55,7 +57,7 @@ pub(crate) async fn task<S, I, Request>(
                             let buffer = Uint8Array::from(&response[..]).buffer();
                             post_args.unshift(&buffer);
                             transfer_args.unshift(&buffer);
-                            interface.post_message(&post_args, &transfer_args).unwrap();
+                            port.post_message(&post_args, &transfer_args).unwrap();
                         }
                     }
                 }

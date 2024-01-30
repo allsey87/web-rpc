@@ -17,7 +17,7 @@ impl FortyTwo for FortyTwoServiceImpl {
 #[web_rpc::service]
 pub trait Channel {
     #[post(transfer(return))]
-    async fn start() -> web_sys::MessagePort;
+    fn start() -> web_sys::MessagePort;
 }
 
 #[derive(Default)]
@@ -26,13 +26,16 @@ struct ChannelServiceImpl {
 }
 
 impl Channel for ChannelServiceImpl {
-    async fn start(&self) -> web_sys::MessagePort {
+    fn start(&self) -> web_sys::MessagePort {
         /* create channel */
         let channel = web_sys::MessageChannel::new().unwrap();
-        /* create and spawn server (shuts down when server_handle is dropped) */
-        let (server, server_handle) = web_rpc::Builder::new(channel.port1())
-            .with_service::<FortyTwoService<_>>(FortyTwoServiceImpl)
-            .build().await
+        /* web_rpc::Interface::new will not complete until the same operation
+           is performed on port2, hence we combine these futures and spawn it
+           on the event loop, before returning port2 to the client */
+        let (server, server_handle) = web_rpc::Interface::new(channel.port1())
+            .then(|interface| web_rpc::Builder::new(interface)
+                .with_service::<FortyTwoService<_>>(FortyTwoServiceImpl)
+                .build())
             .remote_handle();
         wasm_bindgen_futures::spawn_local(server);
         /* store the server_handle inside the struct so that it is not dropped */
@@ -49,21 +52,26 @@ async fn inception() {
     console_error_panic_hook::set_once();
     /* create channel */
     let channel = web_sys::MessageChannel::new().unwrap();
+    let (server_interface, client_interface) = futures_util::future::join(
+        web_rpc::Interface::new(channel.port1()),
+        web_rpc::Interface::new(channel.port2()),
+    ).await;
     /* create and spawn server (shuts down when _server_handle is dropped) */
-    let (server, _server_handle) = web_rpc::Builder::new(channel.port1())
+    let (server, _server_handle) = web_rpc::Builder::new(server_interface)
         .with_service::<ChannelService<_>>(ChannelServiceImpl::default())
-        .build().await
+        .build()
         .remote_handle();
     wasm_bindgen_futures::spawn_local(server);
     /* create client */
-    let client = web_rpc::Builder::new(channel.port2())
+    let client = web_rpc::Builder::new(client_interface)
         .with_client::<ChannelClient>()
-        .build().await;
+        .build();
     /* run test */
-    let port3 = client.start().await;
-    let client = web_rpc::Builder::new(port3)
-        .with_client::<FortyTwoClient>()
-        .build().await;
-    assert_eq!(client.forty_two().await, 42);
+    let remote_client = client.start()
+        .then(web_rpc::Interface::new)
+        .map(|interface| web_rpc::Builder::new(interface)
+            .with_client::<FortyTwoClient>()
+            .build()).await;
+    assert_eq!(remote_client.forty_two().await, 42);
 }
 

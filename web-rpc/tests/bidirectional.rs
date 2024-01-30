@@ -19,16 +19,20 @@ async fn bidirectional() {
     console_error_panic_hook::set_once();
     /* create channel */
     let channel = web_sys::MessageChannel::new().unwrap();
+    let (interface1, interface2) = futures_util::future::join(
+        web_rpc::Interface::new(channel.port1()),
+        web_rpc::Interface::new(channel.port2()),
+    ).await;
     /* create server1 and client1 */
-    let (client1, server1) = web_rpc::Builder::new(channel.port1())
+    let (client1, server1) = web_rpc::Builder::new(interface1)
         .with_service::<CalculatorService<_>>(CalculatorServiceImpl)
         .with_client::<CalculatorClient>()
-        .build().await;
+        .build();
     /* create server2 and client2 */
-    let (client2, server2) = web_rpc::Builder::new(channel.port2())
+    let (client2, server2) = web_rpc::Builder::new(interface2)
         .with_service::<CalculatorService<_>>(CalculatorServiceImpl)
         .with_client::<CalculatorClient>()
-        .build().await;
+        .build();
     /* spawn the servers */
     let (server1, _server_handle1) = server1.remote_handle();
     let (server2, _server_handle2) = server2.remote_handle();
