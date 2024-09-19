@@ -14,9 +14,9 @@ pub type CallbackMap<Response> = HashMap<
     oneshot::Sender<(Response, js_sys::Array)>
 >;
 
-pub type Configuration<Request, Response, P> = (
+pub type Configuration<Request, Response> = (
     Rc<RefCell<CallbackMap<Response>>>,
-    Rc<P>,
+    crate::port::Port,
     Rc<gloo_events::EventListener>,
     Shared<LocalBoxFuture<'static, ()>>,
     Rc<dyn Fn(usize, Request) -> Vec<u8>>,

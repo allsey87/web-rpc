@@ -294,9 +294,7 @@ impl<'a> ServiceGenerator<'a> {
                         web_rpc::client::CallbackMap<#response_ident>
                     >
                 >,
-                port: std::rc::Rc<
-                    dyn web_rpc::port::Port
-                >,
+                port: web_rpc::port::Port,
                 listener: std::rc::Rc<web_rpc::gloo_events::EventListener>,
                 dispatcher: web_rpc::futures_util::future::Shared<
                     web_rpc::futures_core::future::LocalBoxFuture<'static, ()>
@@ -317,10 +315,10 @@ impl<'a> ServiceGenerator<'a> {
                 type Request = #request_ident;
                 type Response = #response_ident;
             }
-            impl<P> From<web_rpc::client::Configuration<#request_ident, #response_ident, P>>
-                for #client_ident where P: web_rpc::port::Port + 'static {
+            impl From<web_rpc::client::Configuration<#request_ident, #response_ident>>
+                for #client_ident {
                 fn from((callback_map, port, listener, dispatcher, request_serializer, abort_sender):
-                    web_rpc::client::Configuration<#request_ident, #response_ident, P>) -> Self {
+                    web_rpc::client::Configuration<#request_ident, #response_ident>) -> Self {
                     Self {
                         callback_map,
                         port,

@@ -1,22 +1,20 @@
-use std::rc::Rc;
-
 use futures_channel::{mpsc, oneshot};
 use futures_util::future;
 use wasm_bindgen::{JsCast, JsValue};
 
-pub struct Interface<P> {
-    pub(crate) port: Rc<P>,
+pub struct Interface {
+    pub(crate) port: crate::port::Port,
     pub(crate) listener: gloo_events::EventListener,
     pub(crate) messages_rx: mpsc::UnboundedReceiver<js_sys::Array>,
 }
 
-impl<P: crate::port::Port + 'static> Interface<P> {
-    pub async fn new(port: P) -> Self {
-        let port = Rc::new(port);
+impl Interface {
+    pub async fn new(port: impl Into<crate::port::Port>) -> Self {
+        let port = port.into();
         let (dispatcher_tx, dispatcher_rx) = mpsc::unbounded();
         let (ready_tx, ready_rx) = oneshot::channel();
         let mut ready_tx = Option::from(ready_tx);
-        let listener = gloo_events::EventListener::new((*port).as_ref(), "message", move |event| {
+        let listener = gloo_events::EventListener::new(port.event_target(), "message", move |event| {
             let message = event.unchecked_ref::<web_sys::MessageEvent>().data();
             match message.dyn_into::<js_sys::Array>() {
                 /* default path, enqueue the message for deserialization by the dispatcher */

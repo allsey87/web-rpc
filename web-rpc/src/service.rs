@@ -1,4 +1,4 @@
-use std::{collections::HashMap, rc::Rc};
+use std::collections::HashMap;
 
 use futures_channel::{mpsc, oneshot};
 use futures_core::{future::LocalBoxFuture, Future};
@@ -19,15 +19,14 @@ pub trait Service {
     ) -> impl Future<Output = (usize, Option<(Self::Response, Array, Array)>)>;
 }
 
-pub(crate) async fn task<S, P, Request>(
+pub(crate) async fn task<S, Request>(
     service: S,
-    port: Rc<P>,
+    port: crate::port::Port,
     mut dispatcher: Shared<LocalBoxFuture<'static, ()>>,
     mut server_requests_rx: mpsc::UnboundedReceiver<(usize, <S as Service>::Request, js_sys::Array)>,
     mut abort_requests_rx: mpsc::UnboundedReceiver<usize>,
 ) where
     S: Service + 'static,
-    P: crate::port::Port + 'static,
     Request: Serialize,
     <S as Service>::Response: Serialize {
     let mut server_tasks: HashMap<usize, oneshot::Sender<_>> = Default::default();

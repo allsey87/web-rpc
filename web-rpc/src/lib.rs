@@ -33,14 +33,14 @@ pub enum Message<Request, Response> {
     Response(usize, Response),
 }
 
-pub struct Builder<C, S, P> {
+pub struct Builder<C, S> {
     client: PhantomData<C>,
     service: S,
-    interface: Interface<P>,
+    interface: Interface,
 }
 
-impl<P> Builder<(), (), P> {
-    pub fn new(interface: Interface<P>) -> Self {
+impl Builder<(), ()> {
+    pub fn new(interface: Interface) -> Self {
         Self {
             interface,
             client: PhantomData::<()>,
@@ -49,21 +49,21 @@ impl<P> Builder<(), (), P> {
     }
 }
 
-impl<C, P> Builder<C, (), P> {
+impl<C> Builder<C, ()> {
     pub fn with_service<S: service::Service>(
         self,
         implementation: impl Into<S>
-    ) -> Builder<C, S, P> {
+    ) -> Builder<C, S> {
         let service = implementation.into();
         let Builder { interface, client, .. } = self;
         Builder { interface, client, service }
     }
 }
 
-impl<S, P> Builder<(), S, P> {
+impl<S> Builder<(), S> {
     pub fn with_client<C: client::Client>(
         self,
-    ) -> Builder<C, S, P> {
+    ) -> Builder<C, S> {
         let Builder { interface, service, .. } = self;
         Builder { interface, client: PhantomData::<C>, service }
     }
@@ -85,9 +85,8 @@ impl Future for Server {
     }
 }
 
-impl<C, P> Builder<C, (), P> where
-    C: client::Client + From<client::Configuration<C::Request, C::Response, P>> + 'static,
-    P: port::Port + 'static,
+impl<C> Builder<C, ()> where
+    C: client::Client + From<client::Configuration<C::Request, C::Response>> + 'static,
     <C as client::Client>::Response: DeserializeOwned,
     <C as client::Client>::Request: Serialize {
 
@@ -133,9 +132,8 @@ impl<C, P> Builder<C, (), P> where
     }
 }
 
-impl<S, P> Builder<(), S, P> where
+impl<S> Builder<(), S> where
     S: service::Service + 'static,
-    P: port::Port + 'static,
     <S as service::Service>::Request: DeserializeOwned,
     <S as service::Service>::Response: Serialize {
 
@@ -158,7 +156,7 @@ impl<S, P> Builder<(), S, P> where
         }.boxed_local().shared();
         Server {
             _listener: Rc::new(listener),
-            task: service::task::<S, P, ()>(
+            task: service::task::<S, ()>(
                 service,
                 port,
                 dispatcher,
@@ -169,10 +167,9 @@ impl<S, P> Builder<(), S, P> where
     }
 }
 
-impl<C, S, P> Builder<C, S, P> where
-    C: client::Client + From<client::Configuration<C::Request, C::Response, P>> + 'static,
+impl<C, S> Builder<C, S> where
+    C: client::Client + From<client::Configuration<C::Request, C::Response>> + 'static,
     S: service::Service + 'static,
-    P: port::Port + 'static,
     <S as service::Service>::Request: DeserializeOwned,
     <S as service::Service>::Response: Serialize,
     <C as client::Client>::Request: Serialize,
@@ -224,7 +221,7 @@ impl<C, S, P> Builder<C, S, P> where
         ));
         let server = Server {
             _listener: listener,
-            task: service::task::<S, P, C::Request>(
+            task: service::task::<S, C::Request>(
                 server,
                 port,
                 dispatcher,

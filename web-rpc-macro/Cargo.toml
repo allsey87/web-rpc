@@ -12,7 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [lib]
-proc_macro = true
+proc-macro = true
 
 [dependencies]
 syn = { version = "1.0", features = ["full"] }
