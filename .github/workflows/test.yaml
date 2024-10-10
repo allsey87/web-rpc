@@ -14,8 +14,9 @@ jobs:
           toolchain: stable
           target: wasm32-unknown-unknown
           components: rustfmt
-      - name: Install wasm-bindgen
+      - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@main
+      - name: Install wasm-bindgen
         run: cargo binstall wasm-bindgen-cli@0.2.89
       - name: Run tests
         run: cargo test
