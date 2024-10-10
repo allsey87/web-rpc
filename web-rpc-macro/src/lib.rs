@@ -584,6 +584,11 @@ impl Parse for RpcMethod {
     }
 }
 
+/// This attribute macro should applied to traits that need to be turned into RPCs. The 
+/// macro will consume the trait and output three items in its place. For example,
+/// a trait `Calculator` will be replaced with two structs `CalculatorClient` and
+/// `CalculatorService` and a new trait by the same name with the methods which have had
+/// the a `&self` receiver added to them.
 #[proc_macro_attribute]
 pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let Service {

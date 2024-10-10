@@ -3,12 +3,12 @@ members = ["web-rpc", "web-rpc-macro"]
 resolver = "2"
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
-authors = ["Michael Allwright <michael.allwright@rustify.be>"]
+authors = ["Michael Allwright <contact@allwright.io>"]
 description = "Bi-directional RPC for the Web"
-repository = "https://github.com/rustifybe/web-rpc"
-homepage = "https://github.com/rustifybe/web-rpc"
+repository = "https://github.com/allsey87/web-rpc"
+homepage = "https://github.com/allsey87/web-rpc"
 readme = "README.md"
 license = "MIT"
 keywords = ["web", "node", "worker", "channel", "window", "javascript", "rpc"]

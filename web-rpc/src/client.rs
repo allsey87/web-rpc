@@ -4,16 +4,19 @@ use futures_channel::oneshot;
 use futures_core::{future::LocalBoxFuture, Future};
 use futures_util::{future::{self, Shared}, FutureExt};
 
+#[doc(hidden)]
 pub trait Client {
     type Request;
     type Response;
 }
 
+#[doc(hidden)]
 pub type CallbackMap<Response> = HashMap<
     usize,
     oneshot::Sender<(Response, js_sys::Array)>
 >;
 
+#[doc(hidden)]
 pub type Configuration<Request, Response> = (
     Rc<RefCell<CallbackMap<Response>>>,
     crate::port::Port,
@@ -23,6 +26,8 @@ pub type Configuration<Request, Response> = (
     Rc<dyn Fn(usize)>,
 );
 
+/// This future represents a RPC request that is currently being executed. Note that
+/// dropping this future will result in the RPC request being cancelled
 #[must_use = "Either await this future or remove the return type from the RPC method"]
 pub struct RequestFuture<T: 'static> {
     result: LocalBoxFuture<'static, T>,

@@ -1,6 +1,13 @@
 use std::rc::Rc;
 use wasm_bindgen::JsValue;
 
+/// Port abstracts over the different Javascript types that support sending and
+/// receiving messages. We need to abstract over these types since there is no
+/// trait available to describe this interface. Moreover, some of these interfaces
+/// have slightly different semantics, e.g., we need to call [web_sys::MessagePort::start]
+/// for the [web_sys::MessagePort]. The inner variants are wrapped in an [Rc] so that
+/// we can force a worker to terminate when we drop the last instance. Unfortunately,
+/// the browser does not seem to reliably terminate workers during garbage collection.
 #[derive(Clone)]
 pub enum Port {
     Worker(Rc<web_sys::Worker>),
@@ -9,6 +16,7 @@ pub enum Port {
 }
 
 impl Port {
+    /// Dispatch `post_message` for the different implementations
     pub fn post_message(
         &self,
         message: &JsValue,
@@ -24,13 +32,13 @@ impl Port {
         }
     }
 
-    pub fn start(&self) {
+    pub(crate) fn start(&self) {
         if let Port::MessagePort(port) = self {
             port.start()
         }
     }
 
-    pub fn event_target(&self) -> &web_sys::EventTarget {
+    pub(crate) fn event_target(&self) -> &web_sys::EventTarget {
         match self {
             Port::Worker(worker) => worker.as_ref(),
             Port::DedicatedWorkerGlobalScope(scope) => scope.as_ref(),

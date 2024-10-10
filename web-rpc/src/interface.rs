@@ -2,6 +2,8 @@ use futures_channel::{mpsc, oneshot};
 use futures_util::future;
 use wasm_bindgen::{JsCast, JsValue};
 
+/// An interface represents a [`crate::port::Port`] that has been fully initialised and
+/// has verified that the other end of the channel is ready to receive messages.
 pub struct Interface {
     pub(crate) port: crate::port::Port,
     pub(crate) listener: gloo_events::EventListener,
@@ -9,6 +11,10 @@ pub struct Interface {
 }
 
 impl Interface {
+    /// Create a new interface from anything that implements `Into<Port>`, for example,
+    /// a [`web_sys::MessagePort`], a [`web_sys::Worker`], or a [`web_sys::DedicatedWorkerGlobalScope`].
+    /// This function is async and resolves to the new interface instance once the other side of
+    /// the channel is ready.
     pub async fn new(port: impl Into<crate::port::Port>) -> Self {
         let port = port.into();
         let (dispatcher_tx, dispatcher_rx) = mpsc::unbounded();
@@ -27,7 +33,7 @@ impl Interface {
                 }
             }
         });
-        /* needed for P = MessagePort */
+        /* needed for MessagePort */
         port.start();
         /* poll other end of the channel */
         let port_cloned = port.clone();
