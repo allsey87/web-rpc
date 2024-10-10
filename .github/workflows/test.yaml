@@ -1,0 +1,20 @@
+name: Test code
+on: [push, pull_request]
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+      - name: Install the Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: wasm32-unknown-unknown
+          components: rustfmt
+      - name: Install wasm-bindgen
+        run: cargo install --git https://github.com/rustwasm/wasm-bindgen.git  --tag 0.2.87 wasm-bindgen-cli
+      - name: Run tests
+        run: cargo test
