@@ -11,5 +11,5 @@ repository = "https://github.com/allsey87/web-rpc"
 homepage = "https://github.com/allsey87/web-rpc"
 readme = "README.md"
 license = "MIT"
-keywords = ["web", "node", "worker", "channel", "window", "javascript", "rpc"]
+keywords = ["worker", "channel", "window", "javascript", "rpc"]
 categories = ["web-programming", "wasm"]
