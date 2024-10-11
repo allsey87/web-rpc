@@ -1,10 +1,7 @@
-[![Crates.io][crates-badge]][crates-url]
-[![MIT licensed][mit-badge]][mit-url]
-
-[crates-badge]: https://img.shields.io/crates/v/web-rpc.svg
-[crates-url]: https://crates.io/crates/web-rpc
-[mit-badge]: https://img.shields.io/badge/license-MIT-blue.svg
-[mit-url]: LICENSE
+[![CI](https://github.com/allsey87/web-rpc/actions/workflows/test.yaml/badge.svg)](https://github.com/allsey87/web-rpc/actions)
+[![Crates.io](https://img.shields.io/crates/v/web-rpc.svg)](https://crates.io/crates/web-rpc)
+[![api-docs](https://docs.rs/web_rpc/badge.svg)](https://docs.rs/web_rpc/)
+[![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 # web-rpc
 *WARNING: This crate is still being developed and is not ready for production use.*
