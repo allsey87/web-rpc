@@ -1,6 +1,6 @@
 [![CI](https://github.com/allsey87/web-rpc/actions/workflows/test.yaml/badge.svg)](https://github.com/allsey87/web-rpc/actions)
 [![Crates.io](https://img.shields.io/crates/v/web-rpc.svg)](https://crates.io/crates/web-rpc)
-[![api-docs](https://docs.rs/web_rpc/badge.svg)](https://docs.rs/web_rpc/)
+[![api-docs](https://docs.rs/web-rpc/badge.svg)](https://docs.rs/web-rpc/)
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 # web-rpc
