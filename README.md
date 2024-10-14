@@ -49,4 +49,4 @@ let client = web_rpc::Builder::new(client_interface)
 assert_eq!(client.add(41, 1).await, 42);
 ```
 
-For more advanced examples, check out the [crate documentation](https://docs.rs/web-rpc/latest/web_rpc/).
+For more advanced examples, check out the [crate documentation](https://docs.rs/web-rpc/latest/web_rpc/). Need help with your latest project? Get in touch via [contact@allwright.io](mailto:contact@allwright.io) and tell me about what you are working on — I am a freelance software engineer.
