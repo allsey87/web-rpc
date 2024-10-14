@@ -9,10 +9,10 @@ use syn::{
     parenthesized,
     parse::{Parse, ParseStream},
     parse_macro_input, parse_quote,
+    punctuated::Punctuated,
     spanned::Spanned,
     token::Comma,
-    Attribute, FnArg, Ident, Pat, PatType, ReturnType, Token, Type,
-    Visibility, punctuated::Punctuated, NestedMeta, Meta,
+    Attribute, FnArg, Ident, Meta, NestedMeta, Pat, PatType, ReturnType, Token, Type, Visibility,
 };
 
 macro_rules! extend_errors {
@@ -62,14 +62,16 @@ impl<'a> ServiceGenerator<'a> {
             rpcs,
             ..
         } = self;
-        let variants = rpcs.iter().zip(camel_case_idents.iter())
-            .map(|(RpcMethod { args, post, .. }, camel_case_ident)| {
-                let args_filtered = args.iter()
-                    .filter(|arg| matches!(&*arg.pat, Pat::Ident(ident) if !post.contains(&ident.ident)));
+        let variants = rpcs.iter().zip(camel_case_idents.iter()).map(
+            |(RpcMethod { args, post, .. }, camel_case_ident)| {
+                let args_filtered = args.iter().filter(
+                    |arg| matches!(&*arg.pat, Pat::Ident(ident) if !post.contains(&ident.ident)),
+                );
                 quote! {
                     #camel_case_ident { #( #args_filtered ),* }
                 }
-            });
+            },
+        );
         quote! {
             #[derive(web_rpc::serde::Serialize, web_rpc::serde::Deserialize)]
             #vis enum #request_ident {
@@ -86,15 +88,18 @@ impl<'a> ServiceGenerator<'a> {
             rpcs,
             ..
         } = self;
-        let variants = rpcs.iter().zip(camel_case_idents.iter())
-            .map(|(RpcMethod { output, post, .. }, camel_case_ident)| match output {
-                ReturnType::Type(_, ty) if !post.contains(&Ident::new("return", output.span())) => quote! {
-                    #camel_case_ident ( #ty )
-                },
+        let variants = rpcs.iter().zip(camel_case_idents.iter()).map(
+            |(RpcMethod { output, post, .. }, camel_case_ident)| match output {
+                ReturnType::Type(_, ty) if !post.contains(&Ident::new("return", output.span())) => {
+                    quote! {
+                        #camel_case_ident ( #ty )
+                    }
+                }
                 _ => quote! {
                     #camel_case_ident ( () )
                 },
-            });
+            },
+        );
         quote! {
             #[derive(web_rpc::serde::Serialize, web_rpc::serde::Deserialize)]
             #vis enum #response_ident {
@@ -113,47 +118,65 @@ impl<'a> ServiceGenerator<'a> {
         } = self;
 
         let unit_type: &Type = &parse_quote!(());
-        let rpc_fns = rpcs.iter()
-            .map(|RpcMethod { attrs, args, ident, is_async, output, .. }| {
+        let rpc_fns = rpcs.iter().map(
+            |RpcMethod {
+                 attrs,
+                 args,
+                 ident,
+                 is_async,
+                 output,
+                 ..
+             }| {
                 let output = match output {
                     ReturnType::Type(_, ref ty) => ty,
-                    ReturnType::Default => unit_type
+                    ReturnType::Default => unit_type,
                 };
                 let is_async = match is_async {
                     true => quote!(async),
-                    false => quote!()
+                    false => quote!(),
                 };
                 quote! {
                     #( #attrs )*
                     #is_async fn #ident(&self, #( #args ),*) -> #output;
                 }
-            });
+            },
+        );
 
-        let forward_fns = rpcs.iter()
-            .map(|RpcMethod { attrs, args, ident, is_async, output, .. }| {
-                let output = match output {
-                    ReturnType::Type(_, ref ty) => ty,
-                    ReturnType::Default => unit_type
-                };
-                let do_await = match is_async {
-                    true => quote!(.await),
-                    false => quote!()
-                };
-                let is_async = match is_async {
-                    true => quote!(async),
-                    false => quote!()
-                };
-                let forward_args = args.iter().filter_map(|arg| match &*arg.pat {
-                    Pat::Ident(ident) => Some(&ident.ident),
-                    _ => None
-                });
-                quote! {
-                    #( #attrs )*
-                    #is_async fn #ident(&self, #( #args ),*) -> #output {
-                        T::#ident(self, #( #forward_args ),*)#do_await
+        let forward_fns = rpcs
+            .iter()
+            .map(
+                |RpcMethod {
+                     attrs,
+                     args,
+                     ident,
+                     is_async,
+                     output,
+                     ..
+                 }| {
+                    let output = match output {
+                        ReturnType::Type(_, ref ty) => ty,
+                        ReturnType::Default => unit_type,
+                    };
+                    let do_await = match is_async {
+                        true => quote!(.await),
+                        false => quote!(),
+                    };
+                    let is_async = match is_async {
+                        true => quote!(async),
+                        false => quote!(),
+                    };
+                    let forward_args = args.iter().filter_map(|arg| match &*arg.pat {
+                        Pat::Ident(ident) => Some(&ident.ident),
+                        _ => None,
+                    });
+                    quote! {
+                        #( #attrs )*
+                        #is_async fn #ident(&self, #( #args ),*) -> #output {
+                            T::#ident(self, #( #forward_args ),*)#do_await
+                        }
                     }
-                }
-            })
+                },
+            )
             .collect::<Vec<_>>();
 
         quote! {
@@ -484,9 +507,12 @@ impl Parse for RpcMethod {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut errors = Ok(());
         let attrs = input.call(Attribute::parse_outer)?;
-        let (post_attrs, attrs): (Vec<_>, Vec<_>) = attrs.into_iter()
-            .partition(|attr| attr.path.segments.last()
-                .is_some_and(|last_segment| last_segment.ident == "post"));
+        let (post_attrs, attrs): (Vec<_>, Vec<_>) = attrs.into_iter().partition(|attr| {
+            attr.path
+                .segments
+                .last()
+                .is_some_and(|last_segment| last_segment.ident == "post")
+        });
         let mut transfer: HashSet<Ident> = HashSet::new();
         let mut post: HashSet<Ident> = HashSet::new();
         for post_attr in post_attrs {
@@ -495,52 +521,68 @@ impl Parse for RpcMethod {
             for parsed_arg in parsed_args {
                 match &parsed_arg {
                     NestedMeta::Meta(meta) => match meta {
-                        Meta::Path(path) => if let Some(segment) = path.segments.last() {
-                            post.insert(segment.ident.clone());
-                        },
+                        Meta::Path(path) => {
+                            if let Some(segment) = path.segments.last() {
+                                post.insert(segment.ident.clone());
+                            }
+                        }
                         Meta::List(list) => match list.path.segments.last() {
                             Some(last_segment) if last_segment.ident == "transfer" => {
                                 if list.nested.len() != 1 {
                                     extend_errors!(
                                         errors,
-                                        syn::Error::new(parsed_arg.span(), "Syntax error in post attribute")
+                                        syn::Error::new(
+                                            parsed_arg.span(),
+                                            "Syntax error in post attribute"
+                                        )
                                     );
                                 }
                                 match list.nested.first() {
-                                    Some(NestedMeta::Meta(Meta::Path(path))) => match path.segments.last() {
-                                        Some(segment) => {
-                                            post.insert(segment.ident.clone());
-                                            transfer.insert(segment.ident.clone());
-                                        },
-                                        _ => extend_errors!(
-                                            errors,
-                                            syn::Error::new(parsed_arg.span(), "Syntax error in post attribute")
-                                        )
+                                    Some(NestedMeta::Meta(Meta::Path(path))) => {
+                                        match path.segments.last() {
+                                            Some(segment) => {
+                                                post.insert(segment.ident.clone());
+                                                transfer.insert(segment.ident.clone());
+                                            }
+                                            _ => extend_errors!(
+                                                errors,
+                                                syn::Error::new(
+                                                    parsed_arg.span(),
+                                                    "Syntax error in post attribute"
+                                                )
+                                            ),
+                                        }
                                     }
                                     _ => extend_errors!(
                                         errors,
-                                        syn::Error::new(parsed_arg.span(), "Syntax error in post attribute")
-                                    )
+                                        syn::Error::new(
+                                            parsed_arg.span(),
+                                            "Syntax error in post attribute"
+                                        )
+                                    ),
                                 }
                             }
                             _ => extend_errors!(
                                 errors,
-                                syn::Error::new(parsed_arg.span(), "Syntax error in post attribute")
-                            )
-                        }
+                                syn::Error::new(
+                                    parsed_arg.span(),
+                                    "Syntax error in post attribute"
+                                )
+                            ),
+                        },
                         _ => extend_errors!(
                             errors,
                             syn::Error::new(parsed_arg.span(), "Syntax error in post attribute")
-                        )
+                        ),
                     },
                     _ => extend_errors!(
                         errors,
                         syn::Error::new(parsed_arg.span(), "Syntax error in post attribute")
-                    )
+                    ),
                 }
             }
         }
-        
+
         let is_async = input.parse::<Token![async]>().is_ok();
         input.parse::<Token![fn]>()?;
         let ident = input.parse()?;
@@ -549,17 +591,18 @@ impl Parse for RpcMethod {
         let mut args = Vec::new();
         for arg in content.parse_terminated::<FnArg, Comma>(FnArg::parse)? {
             match arg {
-                FnArg::Typed(captured) => {
-                    match &*captured.pat {
-                        Pat::Ident(_) => args.push(captured),
-                        _ => {
-                            extend_errors!(
-                                errors,
-                                syn::Error::new(captured.pat.span(), "patterns are not allowed in RPC arguments")
+                FnArg::Typed(captured) => match &*captured.pat {
+                    Pat::Ident(_) => args.push(captured),
+                    _ => {
+                        extend_errors!(
+                            errors,
+                            syn::Error::new(
+                                captured.pat.span(),
+                                "patterns are not allowed in RPC arguments"
                             )
-                        }
+                        )
                     }
-                }
+                },
                 FnArg::Receiver(_) => {
                     extend_errors!(
                         errors,
@@ -584,7 +627,7 @@ impl Parse for RpcMethod {
     }
 }
 
-/// This attribute macro should applied to traits that need to be turned into RPCs. The 
+/// This attribute macro should applied to traits that need to be turned into RPCs. The
 /// macro will consume the trait and output three items in its place. For example,
 /// a trait `Calculator` will be replaced with two structs `CalculatorClient` and
 /// `CalculatorService` and a new trait by the same name with the methods which have had
@@ -602,7 +645,6 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
         .iter()
         .map(|rpc| snake_to_camel(&rpc.ident.unraw().to_string()))
         .collect();
-
 
     ServiceGenerator {
         trait_ident: ident,

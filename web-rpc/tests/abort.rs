@@ -27,7 +27,8 @@ async fn abort_via_drop() {
     let (server_interface, client_interface) = futures_util::future::join(
         web_rpc::Interface::new(channel.port1()),
         web_rpc::Interface::new(channel.port2()),
-    ).await;
+    )
+    .await;
     /* create and spawn server (shuts down when _server_handle is dropped) */
     let service_impl: Rc<RefCell<u32>> = Default::default();
     let (server, _server_handle) = web_rpc::Builder::new(server_interface)

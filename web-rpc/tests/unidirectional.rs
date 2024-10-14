@@ -20,7 +20,8 @@ async fn unidirectional() {
     let (server_interface, client_interface) = futures_util::future::join(
         web_rpc::Interface::new(channel.port1()),
         web_rpc::Interface::new(channel.port2()),
-    ).await;
+    )
+    .await;
     /* create and spawn server (shuts down when _server_handle is dropped) */
     let (server, _server_handle) = web_rpc::Builder::new(server_interface)
         .with_service::<CalculatorService<_>>(CalculatorServiceImpl)
@@ -34,4 +35,3 @@ async fn unidirectional() {
     /* run test */
     assert_eq!(client.add(41, 1).await, 42);
 }
-

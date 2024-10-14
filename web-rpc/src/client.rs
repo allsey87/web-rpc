@@ -1,8 +1,17 @@
-use std::{cell::RefCell, collections::HashMap, pin::Pin, rc::Rc, task::{Context, Poll}};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    pin::Pin,
+    rc::Rc,
+    task::{Context, Poll},
+};
 
 use futures_channel::oneshot;
 use futures_core::{future::LocalBoxFuture, Future};
-use futures_util::{future::{self, Shared}, FutureExt};
+use futures_util::{
+    future::{self, Shared},
+    FutureExt,
+};
 
 #[doc(hidden)]
 pub trait Client {
@@ -11,10 +20,7 @@ pub trait Client {
 }
 
 #[doc(hidden)]
-pub type CallbackMap<Response> = HashMap<
-    usize,
-    oneshot::Sender<(Response, js_sys::Array)>
->;
+pub type CallbackMap<Response> = HashMap<usize, oneshot::Sender<(Response, js_sys::Array)>>;
 
 #[doc(hidden)]
 pub type Configuration<Request, Response> = (
@@ -49,8 +55,8 @@ impl<T> RequestFuture<T> {
                 .boxed_local(),
             abort: Box::pin(RequestAbort {
                 active: true,
-                abort
-            })
+                abort,
+            }),
         }
     }
 }

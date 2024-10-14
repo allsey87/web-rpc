@@ -22,7 +22,8 @@ async fn bidirectional() {
     let (interface1, interface2) = futures_util::future::join(
         web_rpc::Interface::new(channel.port1()),
         web_rpc::Interface::new(channel.port2()),
-    ).await;
+    )
+    .await;
     /* create server1 and client1 */
     let (client1, server1) = web_rpc::Builder::new(interface1)
         .with_service::<CalculatorService<_>>(CalculatorServiceImpl)
@@ -41,6 +42,6 @@ async fn bidirectional() {
     /* run test */
     match join(client1.add(1, 2), client2.add(3, 4)).await {
         (3, 7) => {}
-        _ => panic!("incorrect result")
+        _ => panic!("incorrect result"),
     }
 }

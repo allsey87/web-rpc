@@ -15,7 +15,7 @@ pub trait Service {
         seq_id: usize,
         abort_rx: oneshot::Receiver<()>,
         request: Self::Request,
-        js_args: Array
+        js_args: Array,
     ) -> impl Future<Output = (usize, Option<(Self::Response, Array, Array)>)>;
 }
 
@@ -23,12 +23,17 @@ pub(crate) async fn task<S, Request>(
     service: S,
     port: crate::port::Port,
     mut dispatcher: Shared<LocalBoxFuture<'static, ()>>,
-    mut server_requests_rx: mpsc::UnboundedReceiver<(usize, <S as Service>::Request, js_sys::Array)>,
+    mut server_requests_rx: mpsc::UnboundedReceiver<(
+        usize,
+        <S as Service>::Request,
+        js_sys::Array,
+    )>,
     mut abort_requests_rx: mpsc::UnboundedReceiver<usize>,
 ) where
     S: Service + 'static,
     Request: Serialize,
-    <S as Service>::Response: Serialize {
+    <S as Service>::Response: Serialize,
+{
     let mut server_tasks: HashMap<usize, oneshot::Sender<_>> = Default::default();
     let mut server_responses_rx: FuturesUnordered<_> = Default::default();
     loop {

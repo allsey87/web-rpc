@@ -22,7 +22,7 @@ pub trait Channel {
 
 #[derive(Default)]
 struct ChannelServiceImpl {
-    server_handle: OnceLock<RemoteHandle<()>>
+    server_handle: OnceLock<RemoteHandle<()>>,
 }
 
 impl Channel for ChannelServiceImpl {
@@ -30,16 +30,19 @@ impl Channel for ChannelServiceImpl {
         /* create channel */
         let channel = web_sys::MessageChannel::new().unwrap();
         /* web_rpc::Interface::new will not complete until the same operation
-           is performed on port2, hence we combine these futures and spawn it
-           on the event loop, before returning port2 to the client */
+        is performed on port2, hence we combine these futures and spawn it
+        on the event loop, before returning port2 to the client */
         let (server, server_handle) = web_rpc::Interface::new(channel.port1())
-            .then(|interface| web_rpc::Builder::new(interface)
-                .with_service::<FortyTwoService<_>>(FortyTwoServiceImpl)
-                .build())
+            .then(|interface| {
+                web_rpc::Builder::new(interface)
+                    .with_service::<FortyTwoService<_>>(FortyTwoServiceImpl)
+                    .build()
+            })
             .remote_handle();
         wasm_bindgen_futures::spawn_local(server);
         /* store the server_handle inside the struct so that it is not dropped */
-        self.server_handle.set(server_handle)
+        self.server_handle
+            .set(server_handle)
             .map_err(|_| "OnceLock already set")
             .unwrap();
         /* return the second port */
@@ -55,7 +58,8 @@ async fn inception() {
     let (server_interface, client_interface) = futures_util::future::join(
         web_rpc::Interface::new(channel.port1()),
         web_rpc::Interface::new(channel.port2()),
-    ).await;
+    )
+    .await;
     /* create and spawn server (shuts down when _server_handle is dropped) */
     let (server, _server_handle) = web_rpc::Builder::new(server_interface)
         .with_service::<ChannelService<_>>(ChannelServiceImpl::default())
@@ -67,11 +71,14 @@ async fn inception() {
         .with_client::<ChannelClient>()
         .build();
     /* run test */
-    let remote_client = client.start()
+    let remote_client = client
+        .start()
         .then(web_rpc::Interface::new)
-        .map(|interface| web_rpc::Builder::new(interface)
-            .with_client::<FortyTwoClient>()
-            .build()).await;
+        .map(|interface| {
+            web_rpc::Builder::new(interface)
+                .with_client::<FortyTwoClient>()
+                .build()
+        })
+        .await;
     assert_eq!(remote_client.forty_two().await, 42);
 }
-

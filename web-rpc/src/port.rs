@@ -12,23 +12,18 @@ use wasm_bindgen::JsValue;
 pub enum Port {
     Worker(Rc<web_sys::Worker>),
     DedicatedWorkerGlobalScope(Rc<web_sys::DedicatedWorkerGlobalScope>),
-    MessagePort(Rc<web_sys::MessagePort>)
+    MessagePort(Rc<web_sys::MessagePort>),
 }
 
 impl Port {
     /// Dispatch `post_message` for the different implementations
-    pub fn post_message(
-        &self,
-        message: &JsValue,
-        transfer: &JsValue
-    ) -> Result<(), JsValue> {
+    pub fn post_message(&self, message: &JsValue, transfer: &JsValue) -> Result<(), JsValue> {
         match self {
-            Port::Worker(worker) =>
-                worker.post_message_with_transfer(message, transfer),
-            Port::DedicatedWorkerGlobalScope(scope) =>
-                scope.post_message_with_transfer(message, transfer),
-            Port::MessagePort(port) =>
-                port.post_message_with_transferable(message, transfer),
+            Port::Worker(worker) => worker.post_message_with_transfer(message, transfer),
+            Port::DedicatedWorkerGlobalScope(scope) => {
+                scope.post_message_with_transfer(message, transfer)
+            }
+            Port::MessagePort(port) => port.post_message_with_transferable(message, transfer),
         }
     }
 
