@@ -67,6 +67,7 @@
 //! before returning the result to the client. Note that we are only awaiting the response of the call to `add`,
 //! the request itself is sent synchronously before we await anything.
 //! 
+//! ## Advanced examples
 //! Now that we have the basic idea of how define an RPC trait and set up a server and client, let's dive into
 //! some of the more advanced features of this library!
 //! 
