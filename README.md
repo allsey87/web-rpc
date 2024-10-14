@@ -4,8 +4,8 @@
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 # web-rpc
-`web-rpc` is a crate for executing RPCs between browsing contexts, web workers, and channels. Similar to Google's [tarpc](https://github.com/google/tarpc), the crate allows you to define your RPC in code using trait syntax. This trait is consumed by a `service` macro, 
-which will generate everything that you need to implement RPC. Two notable features of this crate are that it supports bidirectional RPC over a single channel (e.g., between a [Worker](https://docs.rs/web-sys/latest/web_sys/struct.Worker.html) and a [DedicatedWorkerGlobalScope](https://docs.rs/web-sys/latest/web_sys/struct.DedicatedWorkerGlobalScope.html)) and posting/transferring Javascript types (e.g., [OffscreenCanvas](https://docs.rs/web-sys/latest/web_sys/struct.OffscreenCanvas.html)). The following is a simple example, see the [crate documentation](https://docs.rs/web-rpc/latest/web_rpc/) for more details.
+`web-rpc` is a crate for executing RPCs between browsing contexts, web workers, and channels. Similar to Google's [tarpc](https://github.com/google/tarpc), this crate allows you to define your RPC in code using trait syntax. This trait is consumed by a `service` macro, 
+which will generate everything that you need to implement RPC. Two notable features of this crate are that it supports bidirectional RPC over a single channel (e.g., between a [Worker](https://docs.rs/web-sys/latest/web_sys/struct.Worker.html) and a [DedicatedWorkerGlobalScope](https://docs.rs/web-sys/latest/web_sys/struct.DedicatedWorkerGlobalScope.html)) and posting/transferring Javascript types (e.g., [OffscreenCanvas](https://docs.rs/web-sys/latest/web_sys/struct.OffscreenCanvas.html)). The following is a simple example, see the [crate documentation](https://docs.rs/web-rpc/latest/web_rpc/) for a more complete explaination and more advanced examples.
 
 The following code generates the RPC components using an attribute macro applied to a trait. It is recommended to put this RPC definition into some sort of shared crate that your modules can both access.
 ```rust
