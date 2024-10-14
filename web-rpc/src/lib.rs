@@ -40,7 +40,7 @@
 //!     web_rpc::Interface::new(channel.port1()),
 //!     web_rpc::Interface::new(channel.port2()),
 //! ).await;
-//! // create a server with the first port
+//! // create a server with the first interface
 //! let server = web_rpc::Builder::new(server_interface)
 //!     .with_service::<CalculatorService<_>>(CalculatorServiceImpl)
 //!     .build();
@@ -50,19 +50,19 @@
 //! [`Interface::new`] is async since there is no way to synchronously check whether a channel or
 //! a worker is ready to receive messages. To workaround this, temporary listeners are attached to
 //! determine when a channel is ready for communication. The output of this method is a future that can 
-//! be added to the browser's event loop using [wasm_bindgen_futures::spawn_local], however, this will
-//! run the server indefinitely. For more control, consider wrapping the server with [futures_util::FutureExt::remote_handle]
+//! be added to the browser's event loop using [`wasm_bindgen_futures::spawn_local`], however, this will
+//! run the server indefinitely. For more control, consider wrapping the server with [`futures_util::FutureExt::remote_handle`]
 //! before spawning it, which will shutdown the server once the handle has been dropped. Moving onto the
 //! client:
 //! ```rust
-//! // create a client using the second port
+//! // create a client using the second interface
 //! let client = web_rpc::Builder::new(client_interface)
 //!     .with_client::<CalculatorClient>()
 //!     .build();
 //! /* call `add` */
 //! assert_eq!(client.add(41, 1).await, 42);
 //! ```
-//! That is it! Underneath the hood, the client will serialize its arguments and transfer the bytes to
+//! That is it! Underneath the hood, the client will serialize its arguments using bincode and transfer the bytes to
 //! server. The server will deserialize those arguments and run `<CalculatorServiceImpl as Calculator>::add`
 //! before returning the result to the client. Note that we are only awaiting the response of the call to `add`,
 //! the request itself is sent synchronously before we await anything.
