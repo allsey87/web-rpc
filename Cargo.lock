@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "web-rpc"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "bincode",
  "console_error_panic_hook",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "web-rpc-macro"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "proc-macro2",
  "quote",
