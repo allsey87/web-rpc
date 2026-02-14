@@ -16,6 +16,10 @@
 //! This macro will generate the structs `CalculatorClient`, `CalculatorService`, and a new trait
 //! `Calculator` that you can use to implement the service as follows:
 //! ```rust
+//! # #[web_rpc::service]
+//! # pub trait Calculator {
+//! #     fn add(left: u32, right: u32) -> u32;
+//! # }
 //! struct CalculatorServiceImpl;
 //!
 //! impl Calculator for CalculatorServiceImpl {
@@ -32,9 +36,18 @@
 //! channel from a [`Worker`](https://docs.rs/web-sys/latest/web_sys/struct.Worker.html) or a
 //! [`DedicatedWorkerGlobalScope`](https://docs.rs/web-sys/latest/web_sys/struct.DedicatedWorkerGlobalScope.html).
 //! Let's start by defining the server:
-//! ```rust
+//! ```rust,no_run
+//! # #[web_rpc::service]
+//! # pub trait Calculator {
+//! #     fn add(left: u32, right: u32) -> u32;
+//! # }
+//! # struct CalculatorServiceImpl;
+//! # impl Calculator for CalculatorServiceImpl {
+//! #     fn add(&self, left: u32, right: u32) -> u32 { left + right }
+//! # }
+//! # async fn example() {
 //! // create a MessageChannel
-//! let channel = web_sys::MessageChannel::new();
+//! let channel = web_sys::MessageChannel::new().unwrap();
 //! // Create two interfaces from the ports
 //! let (server_interface, client_interface) = futures_util::future::join(
 //!     web_rpc::Interface::new(channel.port1()),
@@ -46,6 +59,7 @@
 //!     .build();
 //! // spawn the server
 //! wasm_bindgen_futures::spawn_local(server);
+//! # }
 //! ```
 //! [`Interface::new`] is async since there is no way to synchronously check whether a channel or
 //! a worker is ready to receive messages. To workaround this, temporary listeners are attached to
@@ -55,13 +69,19 @@
 //! control, consider wrapping the server with [`futures_util::FutureExt::remote_handle`] before
 //! spawning it, which will shutdown the server once the handle has been dropped. Moving onto the
 //! client:
-//! ```rust
+//! ```rust,no_run
+//! # #[web_rpc::service]
+//! # pub trait Calculator {
+//! #     fn add(left: u32, right: u32) -> u32;
+//! # }
+//! # async fn example(client_interface: web_rpc::Interface) {
 //! // create a client using the second interface
 //! let client = web_rpc::Builder::new(client_interface)
 //!     .with_client::<CalculatorClient>()
 //!     .build();
 //! /* call `add` */
 //! assert_eq!(client.add(41, 1).await, 42);
+//! # }
 //! ```
 //! That is it! Underneath the hood, the client will serialize its arguments using bincode and
 //! transfer the bytes to server. The server will deserialize those arguments and run
@@ -76,7 +96,8 @@
 //! ### Synchronous and asynchronous RPC methods
 //! Server methods can be asynchronous! That is, you can define the following RPC trait and service
 //! implementation:
-//! ```rust
+//! ```rust,no_run
+//! # use std::time::Duration;
 //! #[web_rpc::service]
 //! pub trait Sleep {
 //!     async fn sleep(interval: Duration);
@@ -84,10 +105,8 @@
 //!
 //! struct SleepServiceImpl;
 //! impl Sleep for SleepServiceImpl {
-//!     async fn sleep(&self, interval: Duration) -> bool {
+//!     async fn sleep(&self, interval: Duration) {
 //!         gloo_timers::future::sleep(interval).await;
-//!         // sleep completed (was not cancelled)
-//!         true
 //!     }
 //! }
 //! ```
@@ -130,7 +149,7 @@
 //! pub trait GameEngine {
 //!     #[post(transfer(canvas))]
 //!     fn send_canvas(
-//!         canvas: js_sys::OffscreenCanvas,
+//!         canvas: web_sys::OffscreenCanvas,
 //!     );
 //! }
 //! ```
@@ -140,7 +159,16 @@
 //! side, enabling bi-directional RPC. This is particularly useful if we want to send and receive
 //! messages from a worker without sending it a seperate channel for the bi-directional
 //! communication. Our original example can be extended as follows:
-//! ```rust
+//! ```rust,no_run
+//! # #[web_rpc::service]
+//! # pub trait Calculator {
+//! #     fn add(left: u32, right: u32) -> u32;
+//! # }
+//! # struct CalculatorServiceImpl;
+//! # impl Calculator for CalculatorServiceImpl {
+//! #     fn add(&self, left: u32, right: u32) -> u32 { left + right }
+//! # }
+//! # async fn example() {
 //! /* create channel */
 //! let channel = web_sys::MessageChannel::new().unwrap();
 //! let (interface1, interface2) = futures_util::future::join(
@@ -157,6 +185,7 @@
 //!     .with_service::<CalculatorService<_>>(CalculatorServiceImpl)
 //!     .with_client::<CalculatorClient>()
 //!     .build();
+//! # }
 //! ```
 
 use std::{
@@ -240,12 +269,20 @@ impl<C> Builder<C, ()> {
     /// instance of something that implements the trait to which to applied the
     /// [`macro@service`] macro. For example, if you have a trait `Calculator` to
     /// which you have applied [`macro@service`], you would use this method as follows:
-    /// ```
-    /// struct CalculatorServiceImpl;
-    /// impl Calculator for CalculatorServiceImpl { /* add Calculator's methods */}
-    /// let server = Builder::new(some_interface)
-    ///     .with_service<CalculatorService<_>>(CalculatorServiceImpl)
+    /// ```rust,no_run
+    /// # #[web_rpc::service]
+    /// # pub trait Calculator {
+    /// #     fn add(left: u32, right: u32) -> u32;
+    /// # }
+    /// # struct CalculatorServiceImpl;
+    /// # impl Calculator for CalculatorServiceImpl {
+    /// #     fn add(&self, left: u32, right: u32) -> u32 { left + right }
+    /// # }
+    /// # fn example(some_interface: web_rpc::Interface) {
+    /// let server = web_rpc::Builder::new(some_interface)
+    ///     .with_service::<CalculatorService<_>>(CalculatorServiceImpl)
     ///     .build();
+    /// # }
     /// ```
     pub fn with_service<S: service::Service>(self, implementation: impl Into<S>) -> Builder<C, S> {
         let service = implementation.into();

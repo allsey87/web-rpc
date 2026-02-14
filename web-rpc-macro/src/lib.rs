@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{format_ident, quote, ToTokens};
+use quote::{format_ident, quote, quote_spanned, ToTokens};
 use syn::{
     braced,
     ext::IdentExt,
@@ -32,7 +32,7 @@ struct Service {
 }
 
 struct RpcMethod {
-    is_async: bool,
+    is_async: Option<Token![async]>,
     attrs: Vec<Attribute>,
     ident: Ident,
     args: Vec<PatType>,
@@ -131,11 +131,7 @@ impl<'a> ServiceGenerator<'a> {
                     ReturnType::Type(_, ref ty) => ty,
                     ReturnType::Default => unit_type,
                 };
-                let is_async = match is_async {
-                    true => quote!(async),
-                    false => quote!(),
-                };
-                quote! {
+                quote_spanned! {ident.span()=>
                     #( #attrs )*
                     #is_async fn #ident(&self, #( #args ),*) -> #output;
                 }
@@ -158,18 +154,14 @@ impl<'a> ServiceGenerator<'a> {
                         ReturnType::Default => unit_type,
                     };
                     let do_await = match is_async {
-                        true => quote!(.await),
-                        false => quote!(),
-                    };
-                    let is_async = match is_async {
-                        true => quote!(async),
-                        false => quote!(),
+                        Some(token) => quote_spanned!(token.span=> .await),
+                        None => quote!(),
                     };
                     let forward_args = args.iter().filter_map(|arg| match &*arg.pat {
                         Pat::Ident(ident) => Some(&ident.ident),
                         _ => None,
                     });
-                    quote! {
+                    quote_spanned! {ident.span()=>
                         #( #attrs )*
                         #is_async fn #ident(&self, #( #args ),*) -> #output {
                             T::#ident(self, #( #forward_args ),*)#do_await
@@ -181,6 +173,7 @@ impl<'a> ServiceGenerator<'a> {
 
         quote! {
             #( #attrs )*
+            #[allow(async_fn_in_trait)]
             #vis trait #trait_ident {
                 #( #rpc_fns )*
             }
@@ -295,8 +288,8 @@ impl<'a> ServiceGenerator<'a> {
                             #( #serialize_arg_idents ),*
                         };
                         let __serialized = (self.request_serializer)(__seq_id, __request);
-                        let __serialized = js_sys::Uint8Array::from(&__serialized[..]).buffer();
-                        let __post: &[&wasm_bindgen::JsValue] =
+                        let __serialized = web_rpc::js_sys::Uint8Array::from(&__serialized[..]).buffer();
+                        let __post: &[&web_rpc::wasm_bindgen::JsValue] =
                             &[__serialized.as_ref(), #( #post_arg_idents.as_ref() ),*];
                         let __post = web_rpc::js_sys::Array::from_iter(__post);
                         let __transfer: &[&wasm_bindgen::JsValue] =
@@ -414,7 +407,7 @@ impl<'a> ServiceGenerator<'a> {
                     _ => None
                 });
                 match is_async {
-                    true => quote! {
+                    Some(_) => quote! {
                         Self::Request::#camel_case_ident { #( #serialize_arg_idents ),* } => {
                             #( #extract_js_args )*
                             let __task =
@@ -428,7 +421,7 @@ impl<'a> ServiceGenerator<'a> {
                             }
                         }
                     },
-                    false => quote! {
+                    None => quote! {
                         Self::Request::#camel_case_ident { #( #serialize_arg_idents ),* } => {
                             #( #extract_js_args )*
                             let __response = self.server_impl.#ident(#( #args ),*);
@@ -583,7 +576,7 @@ impl Parse for RpcMethod {
             }
         }
 
-        let is_async = input.parse::<Token![async]>().is_ok();
+        let is_async = input.parse::<Token![async]>().ok();
         input.parse::<Token![fn]>()?;
         let ident = input.parse()?;
         let content;
@@ -611,9 +604,40 @@ impl Parse for RpcMethod {
                 }
             }
         }
-        errors?;
-        let output = input.parse()?;
+        let output: ReturnType = input.parse()?;
         input.parse::<Token![;]>()?;
+
+        let arg_names: HashSet<_> = args
+            .iter()
+            .filter_map(|arg| match &*arg.pat {
+                Pat::Ident(pat_ident) => Some(pat_ident.ident.clone()),
+                _ => None,
+            })
+            .collect();
+        let return_ident = Ident::new("return", output.span());
+        for ident in &post {
+            if *ident != return_ident && !arg_names.contains(ident) {
+                extend_errors!(
+                    errors,
+                    syn::Error::new(
+                        ident.span(),
+                        format!("`{}` does not match any parameter", ident)
+                    )
+                );
+            }
+        }
+        for ident in &transfer {
+            if *ident != return_ident && !post.contains(ident) {
+                extend_errors!(
+                    errors,
+                    syn::Error::new(
+                        ident.span(),
+                        format!("`{}` is marked as transfer but not as post", ident)
+                    )
+                );
+            }
+        }
+        errors?;
 
         Ok(Self {
             is_async,
