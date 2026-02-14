@@ -7,31 +7,25 @@ use js_sys::{Array, Uint8Array};
 use serde::Serialize;
 
 pub trait Service {
-    type Request;
     type Response;
 
     fn execute(
         &self,
         seq_id: usize,
         abort_rx: oneshot::Receiver<()>,
-        request: Self::Request,
+        payload: Vec<u8>,
         js_args: Array,
     ) -> impl Future<Output = (usize, Option<(Self::Response, Array, Array)>)>;
 }
 
-pub(crate) async fn task<S, Request>(
+pub(crate) async fn task<S>(
     service: S,
     port: crate::port::Port,
     mut dispatcher: Shared<LocalBoxFuture<'static, ()>>,
-    mut server_requests_rx: mpsc::UnboundedReceiver<(
-        usize,
-        <S as Service>::Request,
-        js_sys::Array,
-    )>,
+    mut server_requests_rx: mpsc::UnboundedReceiver<(usize, Vec<u8>, js_sys::Array)>,
     mut abort_requests_rx: mpsc::UnboundedReceiver<usize>,
 ) where
     S: Service + 'static,
-    Request: Serialize,
     <S as Service>::Response: Serialize,
 {
     let mut server_tasks: HashMap<usize, oneshot::Sender<_>> = Default::default();
@@ -40,10 +34,10 @@ pub(crate) async fn task<S, Request>(
         futures_util::select! {
             _ = dispatcher => {}
             server_request = server_requests_rx.next() => {
-                let (seq_id, request, post_args) = server_request.unwrap();
+                let (seq_id, payload, post_args) = server_request.unwrap();
                 let (abort_tx, abort_rx) = oneshot::channel::<()>();
                 server_tasks.insert(seq_id, abort_tx);
-                server_responses_rx.push(service.execute(seq_id, abort_rx, request, post_args));
+                server_responses_rx.push(service.execute(seq_id, abort_rx, payload, post_args));
             },
             abort_request = abort_requests_rx.next() => {
                 if let Some(seq_id) = abort_request {
@@ -56,11 +50,15 @@ pub(crate) async fn task<S, Request>(
                 if let Some((seq_id, response)) = server_response {
                     if server_tasks.remove(&seq_id).is_some() {
                         if let Some((response, post_args, transfer_args)) = response {
-                            let response = crate::Message::<Request, S::Response>::Response(seq_id, response);
-                            let response = bincode::serialize(&response).unwrap();
-                            let buffer = Uint8Array::from(&response[..]).buffer();
-                            post_args.unshift(&buffer);
-                            transfer_args.unshift(&buffer);
+                            let header = crate::MessageHeader::Response(seq_id);
+                            let header_bytes = bincode::serialize(&header).unwrap();
+                            let header_buffer = Uint8Array::from(&header_bytes[..]).buffer();
+                            let response_bytes = bincode::serialize(&response).unwrap();
+                            let response_buffer = Uint8Array::from(&response_bytes[..]).buffer();
+                            post_args.unshift(&response_buffer);
+                            post_args.unshift(&header_buffer);
+                            transfer_args.unshift(&response_buffer);
+                            transfer_args.unshift(&header_buffer);
                             port.post_message(&post_args, &transfer_args).unwrap();
                         }
                     }

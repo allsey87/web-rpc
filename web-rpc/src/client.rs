@@ -15,7 +15,6 @@ use futures_util::{
 
 #[doc(hidden)]
 pub trait Client {
-    type Request;
     type Response;
 }
 
@@ -23,12 +22,11 @@ pub trait Client {
 pub type CallbackMap<Response> = HashMap<usize, oneshot::Sender<(Response, js_sys::Array)>>;
 
 #[doc(hidden)]
-pub type Configuration<Request, Response> = (
+pub type Configuration<Response> = (
     Rc<RefCell<CallbackMap<Response>>>,
     crate::port::Port,
     Rc<gloo_events::EventListener>,
     Shared<LocalBoxFuture<'static, ()>>,
-    Rc<dyn Fn(usize, Request) -> Vec<u8>>,
     Rc<dyn Fn(usize)>,
 );
 

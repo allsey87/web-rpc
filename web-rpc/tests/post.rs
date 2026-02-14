@@ -4,14 +4,14 @@ use wasm_bindgen_test::*;
 #[web_rpc::service]
 pub trait Concat {
     #[post(left, right, return)]
-    fn concat_with_space(left: js_sys::JsString, right: js_sys::JsString) -> js_sys::JsString;
+    fn concat_with_space(left: &js_sys::JsString, right: &js_sys::JsString) -> js_sys::JsString;
 }
 struct ConcatServiceImpl;
 impl Concat for ConcatServiceImpl {
     fn concat_with_space(
         &self,
-        left: js_sys::JsString,
-        right: js_sys::JsString,
+        left: &js_sys::JsString,
+        right: &js_sys::JsString,
     ) -> js_sys::JsString {
         js_sys::Array::of2(&left, &right).join(" ")
     }
@@ -39,7 +39,7 @@ async fn post() {
         .build();
     /* run test */
     let response = client
-        .concat_with_space("hello".into(), "world".into())
+        .concat_with_space(&"hello".into(), &"world".into())
         .await;
     assert_eq!(response, "hello world");
 }

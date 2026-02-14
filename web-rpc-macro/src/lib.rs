@@ -12,7 +12,8 @@ use syn::{
     punctuated::Punctuated,
     spanned::Spanned,
     token::Comma,
-    Attribute, FnArg, Ident, Meta, NestedMeta, Pat, PatType, ReturnType, Token, Type, Visibility,
+    Attribute, FnArg, Ident, Lifetime, Meta, NestedMeta, Pat, PatType, ReturnType, Token, Type,
+    Visibility,
 };
 
 macro_rules! extend_errors {
@@ -51,6 +52,7 @@ struct ServiceGenerator<'a> {
     attrs: &'a [Attribute],
     rpcs: &'a [RpcMethod],
     camel_case_idents: &'a [Ident],
+    has_borrowed_args: bool,
 }
 
 impl<'a> ServiceGenerator<'a> {
@@ -60,21 +62,43 @@ impl<'a> ServiceGenerator<'a> {
             request_ident,
             camel_case_idents,
             rpcs,
+            has_borrowed_args,
             ..
         } = self;
+        let lifetime = if has_borrowed_args {
+            quote!(<'a>)
+        } else {
+            quote!()
+        };
         let variants = rpcs.iter().zip(camel_case_idents.iter()).map(
             |(RpcMethod { args, post, .. }, camel_case_ident)| {
-                let args_filtered = args.iter().filter(
-                    |arg| matches!(&*arg.pat, Pat::Ident(ident) if !post.contains(&ident.ident)),
-                );
+                let fields = args
+                    .iter()
+                    .filter(|arg| {
+                        matches!(&*arg.pat, Pat::Ident(ident) if !post.contains(&ident.ident))
+                    })
+                    .map(|arg| {
+                        if has_borrowed_args {
+                            if let Type::Reference(type_ref) = &*arg.ty {
+                                let mut type_ref = type_ref.clone();
+                                type_ref.lifetime = Some(Lifetime::new(
+                                    "'a",
+                                    type_ref.and_token.span(),
+                                ));
+                                let pat = &arg.pat;
+                                return quote! { #pat: #type_ref };
+                            }
+                        }
+                        quote! { #arg }
+                    });
                 quote! {
-                    #camel_case_ident { #( #args_filtered ),* }
+                    #camel_case_ident { #( #fields ),* }
                 }
             },
         );
         quote! {
             #[derive(web_rpc::serde::Serialize, web_rpc::serde::Deserialize)]
-            #vis enum #request_ident {
+            #vis enum #request_ident #lifetime {
                 #( #variants ),*
             }
         }
@@ -287,13 +311,16 @@ impl<'a> ServiceGenerator<'a> {
                         let __request = #request_ident::#camel_case_ident {
                             #( #serialize_arg_idents ),*
                         };
-                        let __serialized = (self.request_serializer)(__seq_id, __request);
-                        let __serialized = web_rpc::js_sys::Uint8Array::from(&__serialized[..]).buffer();
+                        let __header = web_rpc::MessageHeader::Request(__seq_id);
+                        let __header_bytes = web_rpc::bincode::serialize(&__header).unwrap();
+                        let __header_buffer = web_rpc::js_sys::Uint8Array::from(&__header_bytes[..]).buffer();
+                        let __payload_bytes = web_rpc::bincode::serialize(&__request).unwrap();
+                        let __payload_buffer = web_rpc::js_sys::Uint8Array::from(&__payload_bytes[..]).buffer();
                         let __post: &[&web_rpc::wasm_bindgen::JsValue] =
-                            &[__serialized.as_ref(), #( #post_arg_idents.as_ref() ),*];
+                            &[__header_buffer.as_ref(), __payload_buffer.as_ref(), #( #post_arg_idents.as_ref() ),*];
                         let __post = web_rpc::js_sys::Array::from_iter(__post);
-                        let __transfer: &[&wasm_bindgen::JsValue] =
-                            &[__serialized.as_ref(), #( #transfer_arg_idents.as_ref() ),*];
+                        let __transfer: &[&web_rpc::wasm_bindgen::JsValue] =
+                            &[__header_buffer.as_ref(), __payload_buffer.as_ref(), #( #transfer_arg_idents.as_ref() ),*];
                         let __transfer = web_rpc::js_sys::Array::from_iter(__transfer);
                         #maybe_register_callback
                         self.port.post_message(&__post, &__transfer).unwrap();
@@ -315,9 +342,6 @@ impl<'a> ServiceGenerator<'a> {
                 dispatcher: web_rpc::futures_util::future::Shared<
                     web_rpc::futures_core::future::LocalBoxFuture<'static, ()>
                 >,
-                request_serializer: std::rc::Rc<
-                    dyn std::ops::Fn(usize, #request_ident) -> std::vec::Vec<u8>
-                >,
                 abort_sender: std::rc::Rc<dyn std::ops::Fn(usize)>,
                 seq_id: std::rc::Rc<std::cell::RefCell<usize>>
             }
@@ -328,19 +352,17 @@ impl<'a> ServiceGenerator<'a> {
                 }
             }
             impl web_rpc::client::Client for #client_ident {
-                type Request = #request_ident;
                 type Response = #response_ident;
             }
-            impl From<web_rpc::client::Configuration<#request_ident, #response_ident>>
+            impl From<web_rpc::client::Configuration<#response_ident>>
                 for #client_ident {
-                fn from((callback_map, port, listener, dispatcher, request_serializer, abort_sender):
-                    web_rpc::client::Configuration<#request_ident, #response_ident>) -> Self {
+                fn from((callback_map, port, listener, dispatcher, abort_sender):
+                    web_rpc::client::Configuration<#response_ident>) -> Self {
                     Self {
                         callback_map,
                         port,
                         listener,
                         dispatcher,
-                        request_serializer,
                         abort_sender,
                         seq_id: std::default::Default::default()
                     }
@@ -361,8 +383,15 @@ impl<'a> ServiceGenerator<'a> {
             response_ident,
             camel_case_idents,
             rpcs,
+            has_borrowed_args,
             ..
         } = self;
+
+        let request_type = if has_borrowed_args {
+            quote! { #request_ident<'_> }
+        } else {
+            quote! { #request_ident }
+        };
 
         let handlers = rpcs.iter()
             .zip(camel_case_idents.iter())
@@ -374,13 +403,23 @@ impl<'a> ServiceGenerator<'a> {
                     });
                 let extract_js_args = args.iter()
                     .filter_map(|arg| match &*arg.pat {
-                        Pat::Ident(ident) if post.contains(&ident.ident) => {
+                        Pat::Ident(pat_ident) if post.contains(&pat_ident.ident) => {
                             let arg_pat = &arg.pat;
                             let arg_ty = &arg.ty;
-                            Some(quote! {
-                                let #arg_pat = web_rpc::wasm_bindgen::JsCast::dyn_into::<#arg_ty>(__js_args.shift())
-                                    .unwrap();
-                            })
+                            if let Type::Reference(type_ref) = &**arg_ty {
+                                let inner_ty = &type_ref.elem;
+                                let tmp_ident = format_ident!("__tmp_{}", pat_ident.ident);
+                                Some(quote! {
+                                    let #tmp_ident = __js_args.shift();
+                                    let #arg_pat: #arg_ty = web_rpc::wasm_bindgen::JsCast::dyn_ref::<#inner_ty>(&#tmp_ident)
+                                        .unwrap();
+                                })
+                            } else {
+                                Some(quote! {
+                                    let #arg_pat = web_rpc::wasm_bindgen::JsCast::dyn_into::<#arg_ty>(__js_args.shift())
+                                        .unwrap();
+                                })
+                            }
                         },
                         _ => None
                     });
@@ -389,17 +428,17 @@ impl<'a> ServiceGenerator<'a> {
                     (false, _) => quote! {
                         let __post = web_rpc::js_sys::Array::new();
                         let __transfer = web_rpc::js_sys::Array::new();
-                        (Self::Response::#camel_case_ident(__response), __post, __transfer)
+                        (#response_ident::#camel_case_ident(__response), __post, __transfer)
                     },
                     (true, false) => quote! {
                         let __post = web_rpc::js_sys::Array::of1(__response.as_ref());
                         let __transfer = web_rpc::js_sys::Array::new();
-                        (Self::Response::#camel_case_ident(()), __post, __transfer)
+                        (#response_ident::#camel_case_ident(()), __post, __transfer)
                     },
                     (true, true) => quote! {
                         let __post = web_rpc::js_sys::Array::of1(__response.as_ref());
                         let __transfer = web_rpc::js_sys::Array::of1(__response.as_ref());
-                        (Self::Response::#camel_case_ident(()), __post, __transfer)
+                        (#response_ident::#camel_case_ident(()), __post, __transfer)
                     }
                 };
                 let args = args.iter().filter_map(|arg| match &*arg.pat {
@@ -408,7 +447,7 @@ impl<'a> ServiceGenerator<'a> {
                 });
                 match is_async {
                     Some(_) => quote! {
-                        Self::Request::#camel_case_ident { #( #serialize_arg_idents ),* } => {
+                        #request_ident::#camel_case_ident { #( #serialize_arg_idents ),* } => {
                             #( #extract_js_args )*
                             let __task =
                                 web_rpc::futures_util::FutureExt::fuse(self.server_impl.#ident(#( #args ),*));
@@ -422,7 +461,7 @@ impl<'a> ServiceGenerator<'a> {
                         }
                     },
                     None => quote! {
-                        Self::Request::#camel_case_ident { #( #serialize_arg_idents ),* } => {
+                        #request_ident::#camel_case_ident { #( #serialize_arg_idents ),* } => {
                             #( #extract_js_args )*
                             let __response = self.server_impl.#ident(#( #args ),*);
                             Some({
@@ -438,15 +477,15 @@ impl<'a> ServiceGenerator<'a> {
                 server_impl: T
             }
             impl<T: #trait_ident> web_rpc::service::Service for #service_ident<T> {
-                type Request = #request_ident;
                 type Response = #response_ident;
                 async fn execute(
                     &self,
                     __seq_id: usize,
                     mut __abort_rx: web_rpc::futures_channel::oneshot::Receiver<()>,
-                    __request: Self::Request,
+                    __payload: std::vec::Vec<u8>,
                     __js_args: web_rpc::js_sys::Array
                 ) -> (usize, Option<(Self::Response, web_rpc::js_sys::Array, web_rpc::js_sys::Array)>) {
+                    let __request: #request_type = web_rpc::bincode::deserialize(&__payload).unwrap();
                     let __result = match __request {
                         #( #handlers )*
                     };
@@ -670,6 +709,13 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
         .map(|rpc| snake_to_camel(&rpc.ident.unraw().to_string()))
         .collect();
 
+    let has_borrowed_args = rpcs.iter().any(|rpc| {
+        rpc.args.iter().any(|arg| {
+            matches!(&*arg.pat, Pat::Ident(pat_ident) if !rpc.post.contains(&pat_ident.ident))
+                && matches!(&*arg.ty, Type::Reference(_))
+        })
+    });
+
     ServiceGenerator {
         trait_ident: ident,
         service_ident: &format_ident!("{}Service", ident),
@@ -684,6 +730,7 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
             .zip(camel_case_fn_names.iter())
             .map(|(rpc, name)| Ident::new(name, rpc.ident.span()))
             .collect::<Vec<_>>(),
+        has_borrowed_args,
     }
     .into_token_stream()
     .into()
