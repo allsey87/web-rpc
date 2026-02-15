@@ -25,15 +25,21 @@ macro_rules! extend_errors {
     };
 }
 
-/// If `ty` is `Stream<T>` or `web_rpc::Stream<T>`, returns Some(T).
+/// If `ty` is `impl Stream<Item = T>`, returns Some(T).
 fn stream_item_type(ty: &Type) -> Option<&Type> {
-    if let Type::Path(type_path) = ty {
-        let last_segment = type_path.path.segments.last()?;
-        if last_segment.ident == "Stream" {
-            if let syn::PathArguments::AngleBracketed(args) = &last_segment.arguments {
-                if args.args.len() == 1 {
-                    if let syn::GenericArgument::Type(inner) = args.args.first()? {
-                        return Some(inner);
+    if let Type::ImplTrait(impl_trait) = ty {
+        for bound in &impl_trait.bounds {
+            if let syn::TypeParamBound::Trait(trait_bound) = bound {
+                let last_segment = trait_bound.path.segments.last()?;
+                if last_segment.ident == "Stream" {
+                    if let syn::PathArguments::AngleBracketed(args) = &last_segment.arguments {
+                        for arg in &args.args {
+                            if let syn::GenericArgument::Binding(binding) = arg {
+                                if binding.ident == "Item" {
+                                    return Some(&binding.ty);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -182,7 +188,7 @@ impl<'a> ServiceGenerator<'a> {
                     if let Some(item_ty) = stream_item_type(ty) {
                         return quote_spanned! {ident.span()=>
                             #( #attrs )*
-                            #is_async fn #ident(#receiver, #( #args ),*) -> web_rpc::futures_channel::mpsc::UnboundedReceiver<#item_ty>;
+                            #is_async fn #ident(#receiver, #( #args ),*) -> impl web_rpc::futures_core::Stream<Item = #item_ty>;
                         };
                     }
                 }
@@ -212,7 +218,7 @@ impl<'a> ServiceGenerator<'a> {
                     {
                         let output = if let ReturnType::Type(_, ref ty) = output {
                             if let Some(item_ty) = stream_item_type(ty) {
-                                quote! { web_rpc::futures_channel::mpsc::UnboundedReceiver<#item_ty> }
+                                quote! { impl web_rpc::futures_core::Stream<Item = #item_ty> }
                             } else {
                                 let ty: &Type = ty;
                                 quote! { #ty }
@@ -601,11 +607,11 @@ impl<'a> ServiceGenerator<'a> {
                     // Build the forwarding closure (reused for both async/sync)
                     let fwd_body = quote! {
                         let __stream_tx_clone = __stream_tx.clone();
+                        web_rpc::pin_utils::pin_mut!(__user_rx);
                         let __fwd = async move {
                             while let Some(__item) = web_rpc::futures_util::StreamExt::next(&mut __user_rx).await {
                                 #wrap_item
                                 if __stream_tx_clone.unbounded_send((__seq_id, Some((__response, __post, __transfer)))).is_err() {
-                                    __user_rx.close();
                                     break;
                                 }
                             }

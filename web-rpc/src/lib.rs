@@ -182,19 +182,19 @@
 //! benefit from zero-copy deserialization.
 //!
 //! ### Streaming
-//! Methods can return a stream of items using [`Stream<T>`] as the return type. On the client
+//! Methods can return a stream of items using `impl Stream<Item = T>` as the return type.
+//! The macro detects this and generates the appropriate client and server code. On the client
 //! side, the method returns a [`client::StreamReceiver<T>`] which implements
-//! [`futures_core::Stream`]. On the server side, the generated trait method returns an
-//! [`mpsc::UnboundedReceiver<T>`](futures_channel::mpsc::UnboundedReceiver):
+//! [`futures_core::Stream`]. On the server side, the return type is preserved as-is:
 //! ```rust
 //! #[web_rpc::service]
 //! pub trait DataSource {
-//!     fn stream_data(&self, count: u32) -> web_rpc::Stream<u32>;
+//!     fn stream_data(&self, count: u32) -> impl futures_core::Stream<Item = u32>;
 //! }
 //!
 //! struct DataSourceImpl;
 //! impl DataSource for DataSourceImpl {
-//!     fn stream_data(&self, count: u32) -> futures_channel::mpsc::UnboundedReceiver<u32> {
+//!     fn stream_data(&self, count: u32) -> impl futures_core::Stream<Item = u32> {
 //!         let (tx, rx) = futures_channel::mpsc::unbounded();
 //!         for i in 0..count {
 //!             let _ = tx.unbounded_send(i);
@@ -297,16 +297,6 @@ pub enum MessageHeader {
     StreamItem(usize),
     StreamEnd(usize),
 }
-
-/// Marker type for streaming RPC return types.
-///
-/// Used in `#[web_rpc::service]` trait definitions to indicate that a method
-/// returns a stream of items rather than a single response.
-///
-/// On the client side, this becomes a [`client::StreamReceiver<T>`].
-/// On the server side, the method receives an
-/// [`mpsc::UnboundedSender<T>`](futures_channel::mpsc::UnboundedSender) parameter.
-pub struct Stream<T>(std::marker::PhantomData<T>);
 
 /// This struct allows one to configure the RPC interface prior to creating it.
 /// To get an instance of this struct, call [`Builder<C, S>::new`] with

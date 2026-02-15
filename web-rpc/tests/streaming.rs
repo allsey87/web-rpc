@@ -1,16 +1,17 @@
 use std::time::Duration;
 
+use futures_core::Stream;
 use futures_util::{FutureExt, StreamExt};
 use wasm_bindgen_test::*;
 
 #[web_rpc::service]
 pub trait DataSource {
-    fn stream_data(&self, count: u32) -> web_rpc::Stream<u32>;
+    fn stream_data(&self, count: u32) -> impl Stream<Item = u32>;
 }
 
 struct DataSourceImpl;
 impl DataSource for DataSourceImpl {
-    fn stream_data(&self, count: u32) -> futures_channel::mpsc::UnboundedReceiver<u32> {
+    fn stream_data(&self, count: u32) -> impl Stream<Item = u32> {
         let (tx, rx) = futures_channel::mpsc::unbounded();
         for i in 0..count {
             let _ = tx.unbounded_send(i);
@@ -69,7 +70,7 @@ async fn empty_stream() {
 #[web_rpc::service]
 pub trait Mixed {
     fn add(&self, left: u32, right: u32) -> u32;
-    fn stream_range(&self, start: u32, end: u32) -> web_rpc::Stream<u32>;
+    fn stream_range(&self, start: u32, end: u32) -> impl Stream<Item = u32>;
 }
 
 struct MixedImpl;
@@ -77,7 +78,7 @@ impl Mixed for MixedImpl {
     fn add(&self, left: u32, right: u32) -> u32 {
         left + right
     }
-    fn stream_range(&self, start: u32, end: u32) -> futures_channel::mpsc::UnboundedReceiver<u32> {
+    fn stream_range(&self, start: u32, end: u32) -> impl Stream<Item = u32> {
         let (tx, rx) = futures_channel::mpsc::unbounded();
         for i in start..end {
             let _ = tx.unbounded_send(i);
@@ -115,7 +116,7 @@ async fn mixed_methods() {
 /// Slow streaming service for testing abort
 #[web_rpc::service]
 pub trait SlowStream {
-    async fn slow_count(&self, target: u32, interval_ms: u32) -> web_rpc::Stream<u32>;
+    async fn slow_count(&self, target: u32, interval_ms: u32) -> impl Stream<Item = u32>;
 }
 
 use std::{cell::RefCell, rc::Rc};
@@ -129,7 +130,7 @@ impl SlowStream for SlowStreamImpl {
         &self,
         target: u32,
         interval_ms: u32,
-    ) -> futures_channel::mpsc::UnboundedReceiver<u32> {
+    ) -> impl Stream<Item = u32> {
         let (tx, rx) = futures_channel::mpsc::unbounded();
         let count = self.count.clone();
         let interval = Duration::from_millis(interval_ms as u64);
@@ -235,12 +236,12 @@ async fn close_and_drain() {
 /// Streaming with borrowed args
 #[web_rpc::service]
 pub trait BorrowedStream {
-    fn stream_prefixed(&self, prefix: &str) -> web_rpc::Stream<String>;
+    fn stream_prefixed(&self, prefix: &str) -> impl Stream<Item = String>;
 }
 
 struct BorrowedStreamImpl;
 impl BorrowedStream for BorrowedStreamImpl {
-    fn stream_prefixed(&self, prefix: &str) -> futures_channel::mpsc::UnboundedReceiver<String> {
+    fn stream_prefixed(&self, prefix: &str) -> impl Stream<Item = String> {
         let (tx, rx) = futures_channel::mpsc::unbounded();
         for i in 0..3 {
             let _ = tx.unbounded_send(format!("{}-{}", prefix, i));
@@ -275,7 +276,7 @@ async fn streaming_with_borrowed_args() {
 #[web_rpc::service]
 pub trait PostStream {
     #[post(return)]
-    fn stream_js_strings(&self, count: u32) -> web_rpc::Stream<js_sys::JsString>;
+    fn stream_js_strings(&self, count: u32) -> impl Stream<Item = js_sys::JsString>;
 }
 
 struct PostStreamImpl;
@@ -283,7 +284,7 @@ impl PostStream for PostStreamImpl {
     fn stream_js_strings(
         &self,
         count: u32,
-    ) -> futures_channel::mpsc::UnboundedReceiver<js_sys::JsString> {
+    ) -> impl Stream<Item = js_sys::JsString> {
         let (tx, rx) = futures_channel::mpsc::unbounded();
         for i in 0..count {
             let _ = tx.unbounded_send(js_sys::JsString::from(format!("item-{}", i)));
