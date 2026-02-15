@@ -25,6 +25,23 @@ macro_rules! extend_errors {
     };
 }
 
+/// If `ty` is `Stream<T>` or `web_rpc::Stream<T>`, returns Some(T).
+fn stream_item_type(ty: &Type) -> Option<&Type> {
+    if let Type::Path(type_path) = ty {
+        let last_segment = type_path.path.segments.last()?;
+        if last_segment.ident == "Stream" {
+            if let syn::PathArguments::AngleBracketed(args) = &last_segment.arguments {
+                if args.args.len() == 1 {
+                    if let syn::GenericArgument::Type(inner) = args.args.first()? {
+                        return Some(inner);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 struct Service {
     attrs: Vec<Attribute>,
     vis: Visibility,
@@ -53,6 +70,7 @@ struct ServiceGenerator<'a> {
     rpcs: &'a [RpcMethod],
     camel_case_idents: &'a [Ident],
     has_borrowed_args: bool,
+    has_streaming_methods: bool,
 }
 
 impl<'a> ServiceGenerator<'a> {
@@ -115,8 +133,15 @@ impl<'a> ServiceGenerator<'a> {
         let variants = rpcs.iter().zip(camel_case_idents.iter()).map(
             |(RpcMethod { output, post, .. }, camel_case_ident)| match output {
                 ReturnType::Type(_, ty) if !post.contains(&Ident::new("return", output.span())) => {
-                    quote! {
-                        #camel_case_ident ( #ty )
+                    // For streaming methods, use the inner item type
+                    if let Some(item_ty) = stream_item_type(ty) {
+                        quote! {
+                            #camel_case_ident ( #item_ty )
+                        }
+                    } else {
+                        quote! {
+                            #camel_case_ident ( #ty )
+                        }
                     }
                 }
                 _ => quote! {
@@ -151,6 +176,14 @@ impl<'a> ServiceGenerator<'a> {
                  output,
                  ..
              }| {
+                if let ReturnType::Type(_, ref ty) = output {
+                    if let Some(item_ty) = stream_item_type(ty) {
+                        return quote_spanned! {ident.span()=>
+                            #( #attrs )*
+                            #is_async fn #ident(&self, #( #args ),*) -> web_rpc::futures_channel::mpsc::UnboundedReceiver<#item_ty>;
+                        };
+                    }
+                }
                 let output = match output {
                     ReturnType::Type(_, ref ty) => ty,
                     ReturnType::Default => unit_type,
@@ -173,22 +206,31 @@ impl<'a> ServiceGenerator<'a> {
                      output,
                      ..
                  }| {
-                    let output = match output {
-                        ReturnType::Type(_, ref ty) => ty,
-                        ReturnType::Default => unit_type,
-                    };
-                    let do_await = match is_async {
-                        Some(token) => quote_spanned!(token.span=> .await),
-                        None => quote!(),
-                    };
-                    let forward_args = args.iter().filter_map(|arg| match &*arg.pat {
-                        Pat::Ident(ident) => Some(&ident.ident),
-                        _ => None,
-                    });
-                    quote_spanned! {ident.span()=>
-                        #( #attrs )*
-                        #is_async fn #ident(&self, #( #args ),*) -> #output {
-                            T::#ident(self, #( #forward_args ),*)#do_await
+                    {
+                        let output = if let ReturnType::Type(_, ref ty) = output {
+                            if let Some(item_ty) = stream_item_type(ty) {
+                                quote! { web_rpc::futures_channel::mpsc::UnboundedReceiver<#item_ty> }
+                            } else {
+                                let ty: &Type = ty;
+                                quote! { #ty }
+                            }
+                        } else {
+                            let ty = unit_type;
+                            quote! { #ty }
+                        };
+                        let do_await = match is_async {
+                            Some(token) => quote_spanned!(token.span=> .await),
+                            None => quote!(),
+                        };
+                        let forward_args = args.iter().filter_map(|arg| match &*arg.pat {
+                            Pat::Ident(ident) => Some(&ident.ident),
+                            _ => None,
+                        });
+                        quote_spanned! {ident.span()=>
+                            #( #attrs )*
+                            #is_async fn #ident(&self, #( #args ),*) -> #output {
+                                T::#ident(self, #( #forward_args ),*)#do_await
+                            }
                         }
                     }
                 },
@@ -222,6 +264,7 @@ impl<'a> ServiceGenerator<'a> {
             response_ident,
             camel_case_idents,
             rpcs,
+            has_streaming_methods,
             ..
         } = self;
 
@@ -246,67 +289,17 @@ impl<'a> ServiceGenerator<'a> {
                         _ => None
                     });
 
-                let return_type = match output {
-                    ReturnType::Type(_, ref ty) => quote! {
-                        web_rpc::client::RequestFuture<#ty>
-                    },
-                    _ => quote!(())
-                };
-                let maybe_register_callback = match output {
-                    ReturnType::Type(_, _) => quote! {
-                        let (__response_tx, __response_rx) =
-                            web_rpc::futures_channel::oneshot::channel();
-                        self.callback_map.borrow_mut().insert(__seq_id, __response_tx);
-                    },
-                    _ => Default::default()
-                };
+                // Check if this is a streaming method
+                let is_streaming = matches!(output, ReturnType::Type(_, ref ty) if stream_item_type(ty).is_some());
 
-                let unpack_response = if post.contains(&Ident::new("return", output.span())) {
-                    let unit_output: &Type = &parse_quote!(());
-                    let output = match output {
-                        ReturnType::Type(_, ref ty) => ty,
-                        _ => unit_output
+                if is_streaming {
+                    let item_ty = match output {
+                        ReturnType::Type(_, ref ty) => stream_item_type(ty).unwrap(),
+                        _ => unreachable!(),
                     };
-                    quote! {
-                        let (_, __post_response) = response;
-                        web_rpc::wasm_bindgen::JsCast::dyn_into::<#output>(__post_response.shift())
-                            .unwrap()
-                    }
-                } else {
-                    quote! {
-                        let (__serialize_response, _) = response;
-                        let #response_ident::#camel_case_ident(__inner) = __serialize_response else {
-                            panic!("received incorrect response variant")
-                        };
-                        __inner
-                    }
-                };
 
-                let maybe_unpack_and_return_future = match output {
-                    ReturnType::Type(_, _) => quote! {
-                        let __response_future = web_rpc::futures_util::FutureExt::map(
-                            __response_rx,
-                            |response| {
-                                let response = response.unwrap();
-                                #unpack_response
-                            }
-                        );
-                        let __abort_sender = self.abort_sender.clone();
-                        let __dispatcher = self.dispatcher.clone();
-                        web_rpc::client::RequestFuture::new(
-                            __response_future,
-                            __dispatcher,
-                            std::boxed::Box::new(move || (__abort_sender)(__seq_id)))
-                    },
-                    _ => Default::default()
-                };
-
-                quote! {
-                    #( #attrs )*
-                    #vis fn #ident(
-                        &self,
-                        #( #args ),*
-                    ) -> #return_type {
+                    // Common: send the request
+                    let send_request = quote! {
                         let __seq_id = self.seq_id.replace_with(|seq_id| seq_id.wrapping_add(1));
                         let __request = #request_ident::#camel_case_ident {
                             #( #serialize_arg_idents ),*
@@ -322,12 +315,162 @@ impl<'a> ServiceGenerator<'a> {
                         let __transfer: &[&web_rpc::wasm_bindgen::JsValue] =
                             &[__header_buffer.as_ref(), __payload_buffer.as_ref(), #( #transfer_arg_idents.as_ref() ),*];
                         let __transfer = web_rpc::js_sys::Array::from_iter(__transfer);
-                        #maybe_register_callback
                         self.port.post_message(&__post, &__transfer).unwrap();
-                        #maybe_unpack_and_return_future
+                    };
+
+                    let unpack_stream_item = if post.contains(&Ident::new("return", output.span())) {
+                        quote! {
+                            |(_response, __post_array)| {
+                                web_rpc::wasm_bindgen::JsCast::dyn_into::<#item_ty>(__post_array.shift())
+                                    .unwrap()
+                            }
+                        }
+                    } else {
+                        quote! {
+                            |(__response, _post_array)| {
+                                let #response_ident::#camel_case_ident(__inner) = __response else {
+                                    panic!("received incorrect response variant")
+                                };
+                                __inner
+                            }
+                        }
+                    };
+
+                    quote! {
+                        #( #attrs )*
+                        #vis fn #ident(
+                            &self,
+                            #( #args ),*
+                        ) -> web_rpc::client::StreamReceiver<#item_ty> {
+                            #send_request
+                            let (__item_tx, __item_rx) = web_rpc::futures_channel::mpsc::unbounded();
+                            self.stream_callback_map.borrow_mut().insert(__seq_id, __item_tx);
+                            let __mapped_rx = web_rpc::futures_util::StreamExt::map(
+                                __item_rx,
+                                #unpack_stream_item
+                            );
+                            let __abort_sender = self.abort_sender.clone();
+                            let __stream_callback_map = self.stream_callback_map.clone();
+                            let __dispatcher = self.dispatcher.clone();
+                            web_rpc::client::StreamReceiver::new(
+                                __mapped_rx,
+                                __dispatcher,
+                                std::boxed::Box::new(move || {
+                                    __stream_callback_map.borrow_mut().remove(&__seq_id);
+                                    (__abort_sender)(__seq_id);
+                                }),
+                            )
+                        }
+                    }
+                } else {
+                    // Non-streaming (original logic)
+                    let return_type = match output {
+                        ReturnType::Type(_, ref ty) => quote! {
+                            web_rpc::client::RequestFuture<#ty>
+                        },
+                        _ => quote!(())
+                    };
+                    let maybe_register_callback = match output {
+                        ReturnType::Type(_, _) => quote! {
+                            let (__response_tx, __response_rx) =
+                                web_rpc::futures_channel::oneshot::channel();
+                            self.callback_map.borrow_mut().insert(__seq_id, __response_tx);
+                        },
+                        _ => Default::default()
+                    };
+
+                    let unpack_response = if post.contains(&Ident::new("return", output.span())) {
+                        let unit_output: &Type = &parse_quote!(());
+                        let output = match output {
+                            ReturnType::Type(_, ref ty) => ty,
+                            _ => unit_output
+                        };
+                        quote! {
+                            let (_, __post_response) = response;
+                            web_rpc::wasm_bindgen::JsCast::dyn_into::<#output>(__post_response.shift())
+                                .unwrap()
+                        }
+                    } else {
+                        quote! {
+                            let (__serialize_response, _) = response;
+                            let #response_ident::#camel_case_ident(__inner) = __serialize_response else {
+                                panic!("received incorrect response variant")
+                            };
+                            __inner
+                        }
+                    };
+
+                    let maybe_unpack_and_return_future = match output {
+                        ReturnType::Type(_, _) => quote! {
+                            let __response_future = web_rpc::futures_util::FutureExt::map(
+                                __response_rx,
+                                |response| {
+                                    let response = response.unwrap();
+                                    #unpack_response
+                                }
+                            );
+                            let __abort_sender = self.abort_sender.clone();
+                            let __dispatcher = self.dispatcher.clone();
+                            web_rpc::client::RequestFuture::new(
+                                __response_future,
+                                __dispatcher,
+                                std::boxed::Box::new(move || (__abort_sender)(__seq_id)))
+                        },
+                        _ => Default::default()
+                    };
+
+                    quote! {
+                        #( #attrs )*
+                        #vis fn #ident(
+                            &self,
+                            #( #args ),*
+                        ) -> #return_type {
+                            let __seq_id = self.seq_id.replace_with(|seq_id| seq_id.wrapping_add(1));
+                            let __request = #request_ident::#camel_case_ident {
+                                #( #serialize_arg_idents ),*
+                            };
+                            let __header = web_rpc::MessageHeader::Request(__seq_id);
+                            let __header_bytes = web_rpc::bincode::serialize(&__header).unwrap();
+                            let __header_buffer = web_rpc::js_sys::Uint8Array::from(&__header_bytes[..]).buffer();
+                            let __payload_bytes = web_rpc::bincode::serialize(&__request).unwrap();
+                            let __payload_buffer = web_rpc::js_sys::Uint8Array::from(&__payload_bytes[..]).buffer();
+                            let __post: &[&web_rpc::wasm_bindgen::JsValue] =
+                                &[__header_buffer.as_ref(), __payload_buffer.as_ref(), #( #post_arg_idents.as_ref() ),*];
+                            let __post = web_rpc::js_sys::Array::from_iter(__post);
+                            let __transfer: &[&web_rpc::wasm_bindgen::JsValue] =
+                                &[__header_buffer.as_ref(), __payload_buffer.as_ref(), #( #transfer_arg_idents.as_ref() ),*];
+                            let __transfer = web_rpc::js_sys::Array::from_iter(__transfer);
+                            #maybe_register_callback
+                            self.port.post_message(&__post, &__transfer).unwrap();
+                            #maybe_unpack_and_return_future
+                        }
                     }
                 }
             });
+
+        let stream_callback_map_field = if has_streaming_methods {
+            quote! {
+                stream_callback_map: std::rc::Rc<
+                    std::cell::RefCell<
+                        web_rpc::client::StreamCallbackMap<#response_ident>
+                    >
+                >,
+            }
+        } else {
+            quote!()
+        };
+
+        let stream_callback_map_pat = if has_streaming_methods {
+            quote! { stream_callback_map, }
+        } else {
+            quote! { _, }
+        };
+
+        let stream_callback_map_init = if has_streaming_methods {
+            quote! { stream_callback_map, }
+        } else {
+            quote! {}
+        };
 
         quote! {
             #[derive(core::clone::Clone)]
@@ -337,6 +480,7 @@ impl<'a> ServiceGenerator<'a> {
                         web_rpc::client::CallbackMap<#response_ident>
                     >
                 >,
+                #stream_callback_map_field
                 port: web_rpc::port::Port,
                 listener: std::rc::Rc<web_rpc::gloo_events::EventListener>,
                 dispatcher: web_rpc::futures_util::future::Shared<
@@ -356,10 +500,11 @@ impl<'a> ServiceGenerator<'a> {
             }
             impl From<web_rpc::client::Configuration<#response_ident>>
                 for #client_ident {
-                fn from((callback_map, port, listener, dispatcher, abort_sender):
+                fn from((callback_map, #stream_callback_map_pat port, listener, dispatcher, abort_sender):
                     web_rpc::client::Configuration<#response_ident>) -> Self {
                     Self {
                         callback_map,
+                        #stream_callback_map_init
                         port,
                         listener,
                         dispatcher,
@@ -423,50 +568,134 @@ impl<'a> ServiceGenerator<'a> {
                         },
                         _ => None
                     });
-                let return_ident = Ident::new("return", output.span());
-                let return_response = match (post.contains(&return_ident), transfer.contains(&return_ident)) {
-                    (false, _) => quote! {
-                        let __post = web_rpc::js_sys::Array::new();
-                        let __transfer = web_rpc::js_sys::Array::new();
-                        (#response_ident::#camel_case_ident(__response), __post, __transfer)
-                    },
-                    (true, false) => quote! {
-                        let __post = web_rpc::js_sys::Array::of1(__response.as_ref());
-                        let __transfer = web_rpc::js_sys::Array::new();
-                        (#response_ident::#camel_case_ident(()), __post, __transfer)
-                    },
-                    (true, true) => quote! {
-                        let __post = web_rpc::js_sys::Array::of1(__response.as_ref());
-                        let __transfer = web_rpc::js_sys::Array::of1(__response.as_ref());
-                        (#response_ident::#camel_case_ident(()), __post, __transfer)
-                    }
-                };
-                let args = args.iter().filter_map(|arg| match &*arg.pat {
-                    Pat::Ident(ident) => Some(&ident.ident),
-                    _ => None
-                });
-                match is_async {
-                    Some(_) => quote! {
-                        #request_ident::#camel_case_ident { #( #serialize_arg_idents ),* } => {
-                            #( #extract_js_args )*
-                            let __task =
-                                web_rpc::futures_util::FutureExt::fuse(self.server_impl.#ident(#( #args ),*));
-                            web_rpc::pin_utils::pin_mut!(__task);
-                            web_rpc::futures_util::select! {
-                                _ = __abort_rx => None,
-                                __response = __task => Some({
-                                    #return_response
-                                })
+
+                // Check if this is a streaming method
+                let is_streaming = matches!(output, ReturnType::Type(_, ref ty) if stream_item_type(ty).is_some());
+
+                if is_streaming {
+                    let call_args = args.iter().filter_map(|arg| match &*arg.pat {
+                        Pat::Ident(ident) => Some(&ident.ident),
+                        _ => None
+                    });
+                    let return_ident = Ident::new("return", output.span());
+                    let wrap_item = match (post.contains(&return_ident), transfer.contains(&return_ident)) {
+                        (false, _) => quote! {
+                            let __response = #response_ident::#camel_case_ident(__item);
+                            let __post = web_rpc::js_sys::Array::new();
+                            let __transfer = web_rpc::js_sys::Array::new();
+                        },
+                        (true, false) => quote! {
+                            let __response = #response_ident::#camel_case_ident(());
+                            let __post = web_rpc::js_sys::Array::of1(__item.as_ref());
+                            let __transfer = web_rpc::js_sys::Array::new();
+                        },
+                        (true, true) => quote! {
+                            let __response = #response_ident::#camel_case_ident(());
+                            let __post = web_rpc::js_sys::Array::of1(__item.as_ref());
+                            let __transfer = web_rpc::js_sys::Array::of1(__item.as_ref());
+                        },
+                    };
+                    // Build the forwarding closure (reused for both async/sync)
+                    let fwd_body = quote! {
+                        let __stream_tx_clone = __stream_tx.clone();
+                        let __fwd = async move {
+                            while let Some(__item) = web_rpc::futures_util::StreamExt::next(&mut __user_rx).await {
+                                #wrap_item
+                                if __stream_tx_clone.unbounded_send((__seq_id, Some((__response, __post, __transfer)))).is_err() {
+                                    __user_rx.close();
+                                    break;
+                                }
                             }
+                        };
+                        let __fwd = web_rpc::futures_util::FutureExt::fuse(__fwd);
+                        web_rpc::pin_utils::pin_mut!(__fwd);
+                        web_rpc::futures_util::select! {
+                            _ = __abort_rx => {},
+                            _ = __fwd => {},
                         }
-                    },
-                    None => quote! {
-                        #request_ident::#camel_case_ident { #( #serialize_arg_idents ),* } => {
-                            #( #extract_js_args )*
-                            let __response = self.server_impl.#ident(#( #args ),*);
-                            Some({
-                                #return_response
-                            })
+                        let _ = __stream_tx.unbounded_send((__seq_id, None));
+                        web_rpc::service::ExecuteResult::StreamComplete
+                    };
+
+                    match is_async {
+                        Some(_) => quote! {
+                            #request_ident::#camel_case_ident { #( #serialize_arg_idents ),* } => {
+                                #( #extract_js_args )*
+                                let __get_rx = web_rpc::futures_util::FutureExt::fuse(
+                                    self.server_impl.#ident(#( #call_args ),*)
+                                );
+                                web_rpc::pin_utils::pin_mut!(__get_rx);
+                                let __maybe_rx = web_rpc::futures_util::select! {
+                                    _ = __abort_rx => None,
+                                    __rx = __get_rx => Some(__rx),
+                                };
+                                if let Some(mut __user_rx) = __maybe_rx {
+                                    #fwd_body
+                                } else {
+                                    let _ = __stream_tx.unbounded_send((__seq_id, None));
+                                    web_rpc::service::ExecuteResult::StreamComplete
+                                }
+                            }
+                        },
+                        None => quote! {
+                            #request_ident::#camel_case_ident { #( #serialize_arg_idents ),* } => {
+                                #( #extract_js_args )*
+                                let mut __user_rx = self.server_impl.#ident(#( #call_args ),*);
+                                #fwd_body
+                            }
+                        },
+                    }
+                } else {
+                    // Non-streaming (original logic, but wrapped in ExecuteResult::Response)
+                    let return_ident = Ident::new("return", output.span());
+                    let return_response = match (post.contains(&return_ident), transfer.contains(&return_ident)) {
+                        (false, _) => quote! {
+                            let __post = web_rpc::js_sys::Array::new();
+                            let __transfer = web_rpc::js_sys::Array::new();
+                            (#response_ident::#camel_case_ident(__response), __post, __transfer)
+                        },
+                        (true, false) => quote! {
+                            let __post = web_rpc::js_sys::Array::of1(__response.as_ref());
+                            let __transfer = web_rpc::js_sys::Array::new();
+                            (#response_ident::#camel_case_ident(()), __post, __transfer)
+                        },
+                        (true, true) => quote! {
+                            let __post = web_rpc::js_sys::Array::of1(__response.as_ref());
+                            let __transfer = web_rpc::js_sys::Array::of1(__response.as_ref());
+                            (#response_ident::#camel_case_ident(()), __post, __transfer)
+                        }
+                    };
+                    let call_args = args.iter().filter_map(|arg| match &*arg.pat {
+                        Pat::Ident(ident) => Some(&ident.ident),
+                        _ => None
+                    });
+                    match is_async {
+                        Some(_) => quote! {
+                            #request_ident::#camel_case_ident { #( #serialize_arg_idents ),* } => {
+                                #( #extract_js_args )*
+                                let __task =
+                                    web_rpc::futures_util::FutureExt::fuse(self.server_impl.#ident(#( #call_args ),*));
+                                web_rpc::pin_utils::pin_mut!(__task);
+                                web_rpc::service::ExecuteResult::Response(
+                                    web_rpc::futures_util::select! {
+                                        _ = __abort_rx => None,
+                                        __response = __task => Some({
+                                            #return_response
+                                        })
+                                    }
+                                )
+                            }
+                        },
+                        None => quote! {
+                            #request_ident::#camel_case_ident { #( #serialize_arg_idents ),* } => {
+                                #( #extract_js_args )*
+                                let __response = self.server_impl.#ident(#( #call_args ),*);
+                                web_rpc::service::ExecuteResult::Response(
+                                    Some({
+                                        #return_response
+                                    })
+                                )
+                            }
                         }
                     }
                 }
@@ -483,8 +712,11 @@ impl<'a> ServiceGenerator<'a> {
                     __seq_id: usize,
                     mut __abort_rx: web_rpc::futures_channel::oneshot::Receiver<()>,
                     __payload: std::vec::Vec<u8>,
-                    __js_args: web_rpc::js_sys::Array
-                ) -> (usize, Option<(Self::Response, web_rpc::js_sys::Array, web_rpc::js_sys::Array)>) {
+                    __js_args: web_rpc::js_sys::Array,
+                    __stream_tx: web_rpc::futures_channel::mpsc::UnboundedSender<
+                        web_rpc::service::StreamMessage<Self::Response>
+                    >,
+                ) -> (usize, web_rpc::service::ExecuteResult<Self::Response>) {
                     let __request: #request_type = web_rpc::bincode::deserialize(&__payload).unwrap();
                     let __result = match __request {
                         #( #handlers )*
@@ -716,6 +948,10 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
         })
     });
 
+    let has_streaming_methods = rpcs.iter().any(
+        |rpc| matches!(&rpc.output, ReturnType::Type(_, ref ty) if stream_item_type(ty).is_some()),
+    );
+
     ServiceGenerator {
         trait_ident: ident,
         service_ident: &format_ident!("{}Service", ident),
@@ -731,6 +967,7 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
             .map(|(rpc, name)| Ident::new(name, rpc.ident.span()))
             .collect::<Vec<_>>(),
         has_borrowed_args,
+        has_streaming_methods,
     }
     .into_token_stream()
     .into()

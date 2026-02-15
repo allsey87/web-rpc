@@ -239,7 +239,19 @@ pub enum MessageHeader {
     Request(usize),
     Abort(usize),
     Response(usize),
+    StreamItem(usize),
+    StreamEnd(usize),
 }
+
+/// Marker type for streaming RPC return types.
+///
+/// Used in `#[web_rpc::service]` trait definitions to indicate that a method
+/// returns a stream of items rather than a single response.
+///
+/// On the client side, this becomes a [`client::StreamReceiver<T>`].
+/// On the server side, the method receives an
+/// [`mpsc::UnboundedSender<T>`](futures_channel::mpsc::UnboundedSender) parameter.
+pub struct Stream<T>(std::marker::PhantomData<T>);
 
 /// This struct allows one to configure the RPC interface prior to creating it.
 /// To get an instance of this struct, call [`Builder<C, S>::new`] with
@@ -351,6 +363,9 @@ where
         } = self;
         let client_callback_map: Rc<RefCell<client::CallbackMap<C::Response>>> = Default::default();
         let client_callback_map_cloned = client_callback_map.clone();
+        let stream_callback_map: Rc<RefCell<client::StreamCallbackMap<C::Response>>> =
+            Default::default();
+        let stream_callback_map_cloned = stream_callback_map.clone();
         let dispatcher = async move {
             while let Some(array) = messages_rx.next().await {
                 let header_bytes =
@@ -367,6 +382,18 @@ where
                         {
                             let _ = callback_tx.send((response, array));
                         }
+                    }
+                    MessageHeader::StreamItem(seq_id) => {
+                        let payload_bytes =
+                            Uint8Array::new(&array.shift().dyn_into::<ArrayBuffer>().unwrap())
+                                .to_vec();
+                        let response: C::Response = bincode::deserialize(&payload_bytes).unwrap();
+                        if let Some(tx) = stream_callback_map_cloned.borrow().get(&seq_id) {
+                            let _ = tx.unbounded_send((response, array));
+                        }
+                    }
+                    MessageHeader::StreamEnd(seq_id) => {
+                        stream_callback_map_cloned.borrow_mut().remove(&seq_id);
                     }
                     _ => panic!("client received a server message"),
                 }
@@ -387,6 +414,7 @@ where
         };
         C::from((
             client_callback_map,
+            stream_callback_map,
             port,
             Rc::new(listener),
             dispatcher,
@@ -471,9 +499,12 @@ where
             ..
         } = self;
         let client_callback_map: Rc<RefCell<client::CallbackMap<C::Response>>> = Default::default();
+        let stream_callback_map: Rc<RefCell<client::StreamCallbackMap<C::Response>>> =
+            Default::default();
         let (server_requests_tx, server_requests_rx) = mpsc::unbounded();
         let (abort_requests_tx, abort_requests_rx) = mpsc::unbounded();
         let client_callback_map_cloned = client_callback_map.clone();
+        let stream_callback_map_cloned = stream_callback_map.clone();
         let dispatcher = async move {
             while let Some(array) = messages_rx.next().await {
                 let header_bytes =
@@ -490,6 +521,18 @@ where
                         {
                             let _ = callback_tx.send((response, array));
                         }
+                    }
+                    MessageHeader::StreamItem(seq_id) => {
+                        let payload_bytes =
+                            Uint8Array::new(&array.shift().dyn_into::<ArrayBuffer>().unwrap())
+                                .to_vec();
+                        let response: C::Response = bincode::deserialize(&payload_bytes).unwrap();
+                        if let Some(tx) = stream_callback_map_cloned.borrow().get(&seq_id) {
+                            let _ = tx.unbounded_send((response, array));
+                        }
+                    }
+                    MessageHeader::StreamEnd(seq_id) => {
+                        stream_callback_map_cloned.borrow_mut().remove(&seq_id);
                     }
                     MessageHeader::Request(seq_id) => {
                         let payload =
@@ -521,6 +564,7 @@ where
         let listener = Rc::new(listener);
         let client = C::from((
             client_callback_map,
+            stream_callback_map,
             port.clone(),
             listener.clone(),
             dispatcher.clone(),
