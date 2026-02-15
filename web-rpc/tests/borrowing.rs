@@ -3,10 +3,10 @@ use wasm_bindgen_test::*;
 
 #[web_rpc::service]
 pub trait Greeter {
-    fn greet(name: &str, greeting: &str) -> String;
-    fn count_bytes(data: &[u8]) -> usize;
-    fn mixed(name: &str, id: u32) -> String;
-    fn notify(message: &str);
+    fn greet(&self, name: &str, greeting: &str) -> String;
+    fn count_bytes(&self, data: &[u8]) -> usize;
+    fn mixed(&self, name: &str, id: u32) -> String;
+    fn notify(&self, message: &str);
 }
 
 struct GreeterServiceImpl;

@@ -5,7 +5,7 @@ use wasm_bindgen_test::*;
 
 #[web_rpc::service]
 pub trait FortyTwo {
-    fn forty_two() -> u32;
+    fn forty_two(&self) -> u32;
 }
 struct FortyTwoServiceImpl;
 impl FortyTwo for FortyTwoServiceImpl {
@@ -17,7 +17,7 @@ impl FortyTwo for FortyTwoServiceImpl {
 #[web_rpc::service]
 pub trait Channel {
     #[post(transfer(return))]
-    fn start() -> web_sys::MessagePort;
+    fn start(&self) -> web_sys::MessagePort;
 }
 
 #[derive(Default)]

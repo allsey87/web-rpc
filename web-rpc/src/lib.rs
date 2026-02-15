@@ -10,7 +10,7 @@
 //! ```rust
 //! #[web_rpc::service]
 //! pub trait Calculator {
-//!     fn add(left: u32, right: u32) -> u32;
+//!     fn add(&self, left: u32, right: u32) -> u32;
 //! }
 //! ```
 //! This macro will generate the structs `CalculatorClient`, `CalculatorService`, and a new trait
@@ -18,7 +18,7 @@
 //! ```rust
 //! # #[web_rpc::service]
 //! # pub trait Calculator {
-//! #     fn add(left: u32, right: u32) -> u32;
+//! #     fn add(&self, left: u32, right: u32) -> u32;
 //! # }
 //! struct CalculatorServiceImpl;
 //!
@@ -28,7 +28,7 @@
 //!     }
 //! }
 //! ```
-//! Note that the version of the trait emitted from the macro adds a `&self` receiver. Although not
+//! Note that the `&self` receiver is required in the trait definition. Although not
 //! used in this example, this is useful when we want the RPC to modify some state (via interior
 //! mutability). Now that we have defined our RPC, let's create a client and server for it! In this
 //! example, we will use [`MessageChannel`](https://docs.rs/web-sys/latest/web_sys/struct.MessageChannel.html)
@@ -39,7 +39,7 @@
 //! ```rust,no_run
 //! # #[web_rpc::service]
 //! # pub trait Calculator {
-//! #     fn add(left: u32, right: u32) -> u32;
+//! #     fn add(&self, left: u32, right: u32) -> u32;
 //! # }
 //! # struct CalculatorServiceImpl;
 //! # impl Calculator for CalculatorServiceImpl {
@@ -72,7 +72,7 @@
 //! ```rust,no_run
 //! # #[web_rpc::service]
 //! # pub trait Calculator {
-//! #     fn add(left: u32, right: u32) -> u32;
+//! #     fn add(&self, left: u32, right: u32) -> u32;
 //! # }
 //! # async fn example(client_interface: web_rpc::Interface) {
 //! // create a client using the second interface
@@ -100,7 +100,7 @@
 //! # use std::time::Duration;
 //! #[web_rpc::service]
 //! pub trait Sleep {
-//!     async fn sleep(interval: Duration);
+//!     async fn sleep(&self, interval: Duration);
 //! }
 //!
 //! struct SleepServiceImpl;
@@ -133,6 +133,7 @@
 //! pub trait Concat {
 //!     #[post(left, right, return)]
 //!     fn concat_with_space(
+//!         &self,
 //!         left: js_sys::JsString,
 //!         right: js_sys::JsString
 //!     ) -> js_sys::JsString;
@@ -149,10 +150,64 @@
 //! pub trait GameEngine {
 //!     #[post(transfer(canvas))]
 //!     fn send_canvas(
+//!         &self,
 //!         canvas: web_sys::OffscreenCanvas,
 //!     );
 //! }
 //! ```
+//! ### Borrowed parameters
+//! RPC methods can accept borrowed types such as `&str` and `&[u8]`, which are deserialized
+//! zero-copy on the server side:
+//! ```rust
+//! #[web_rpc::service]
+//! pub trait Greeter {
+//!     fn greet(&self, name: &str, greeting: &str) -> String;
+//!     fn count_bytes(&self, data: &[u8]) -> usize;
+//! }
+//!
+//! struct GreeterServiceImpl;
+//! impl Greeter for GreeterServiceImpl {
+//!     fn greet(&self, name: &str, greeting: &str) -> String {
+//!         format!("{greeting}, {name}!")
+//!     }
+//!     fn count_bytes(&self, data: &[u8]) -> usize {
+//!         data.len()
+//!     }
+//! }
+//! ```
+//! This avoids unnecessary allocations — the server deserializes directly from the received
+//! message bytes without copying into owned `String` or `Vec<u8>` types. On the client side,
+//! borrowed parameters are serialized inline before the method returns, so standard Rust
+//! lifetime rules apply. Note that only types with serde borrowing support (`&str`, `&[u8]`)
+//! benefit from zero-copy deserialization.
+//!
+//! ### Streaming
+//! Methods can return a stream of items using [`Stream<T>`] as the return type. On the client
+//! side, the method returns a [`client::StreamReceiver<T>`] which implements
+//! [`futures_core::Stream`]. On the server side, the generated trait method returns an
+//! [`mpsc::UnboundedReceiver<T>`](futures_channel::mpsc::UnboundedReceiver):
+//! ```rust
+//! #[web_rpc::service]
+//! pub trait DataSource {
+//!     fn stream_data(&self, count: u32) -> web_rpc::Stream<u32>;
+//! }
+//!
+//! struct DataSourceImpl;
+//! impl DataSource for DataSourceImpl {
+//!     fn stream_data(&self, count: u32) -> futures_channel::mpsc::UnboundedReceiver<u32> {
+//!         let (tx, rx) = futures_channel::mpsc::unbounded();
+//!         for i in 0..count {
+//!             let _ = tx.unbounded_send(i);
+//!         }
+//!         rx
+//!     }
+//! }
+//! ```
+//! Dropping the [`client::StreamReceiver`] sends an abort signal to the server, cancelling the
+//! stream. Alternatively, calling [`close`](client::StreamReceiver::close) stops the server
+//! while still allowing buffered items to be drained. Streaming methods can also be async and
+//! can be combined with the `#[post(return)]` attribute for streaming JavaScript types.
+//!
 //! ### Bi-directional RPC
 //! In the original example, we created a server on the first port of the message channel and a
 //! client on the second port. However, it is possible to define both a client and a server on each
@@ -162,7 +217,7 @@
 //! ```rust,no_run
 //! # #[web_rpc::service]
 //! # pub trait Calculator {
-//! #     fn add(left: u32, right: u32) -> u32;
+//! #     fn add(&self, left: u32, right: u32) -> u32;
 //! # }
 //! # struct CalculatorServiceImpl;
 //! # impl Calculator for CalculatorServiceImpl {
@@ -284,7 +339,7 @@ impl<C> Builder<C, ()> {
     /// ```rust,no_run
     /// # #[web_rpc::service]
     /// # pub trait Calculator {
-    /// #     fn add(left: u32, right: u32) -> u32;
+    /// #     fn add(&self, left: u32, right: u32) -> u32;
     /// # }
     /// # struct CalculatorServiceImpl;
     /// # impl Calculator for CalculatorServiceImpl {

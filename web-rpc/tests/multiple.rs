@@ -3,8 +3,8 @@ use wasm_bindgen_test::*;
 
 #[web_rpc::service]
 pub trait Calculator {
-    fn add(left: u32, right: u32) -> u32;
-    fn is_forty_two(value: u32) -> bool;
+    fn add(&self, left: u32, right: u32) -> u32;
+    fn is_forty_two(&self, value: u32) -> bool;
 }
 struct CalculatorServiceImpl;
 impl Calculator for CalculatorServiceImpl {

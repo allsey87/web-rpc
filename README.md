@@ -11,7 +11,7 @@ The following code generates the RPC components using an attribute macro applied
 ```rust
 #[web_rpc::service]
 pub trait Calculator {
-    fn add(left: u32, right: u32) -> u32;
+    fn add(&self, left: u32, right: u32) -> u32;
 }
 ```
 The code above will generate `CalculatorClient`, `CalculatorService`, and a new trait `Calculator` that you can use to implement a calculator as follows:
@@ -49,15 +49,4 @@ let client = web_rpc::Builder::new(client_interface)
 assert_eq!(client.add(41, 1).await, 42);
 ```
 
-### Borrowed parameters
-RPC methods can accept borrowed types such as `&str` and `&[u8]`, which are deserialized zero-copy on the server side:
-```rust
-#[web_rpc::service]
-pub trait Greeter {
-    fn greet(name: &str, greeting: &str) -> String;
-    fn process(data: &[u8]) -> usize;
-}
-```
-This avoids unnecessary allocations — the server deserializes directly from the received message bytes without copying into owned `String` or `Vec<u8>` types. On the client side, the borrowed parameters are serialized inline before the method returns, so standard Rust lifetime rules apply. Note that only types with serde borrowing support (`&str`, `&[u8]`) benefit from zero-copy deserialization.
-
-For more advanced examples, check out the [crate documentation](https://docs.rs/web-rpc/latest/web_rpc/). Need help with your latest project? Get in touch via [contact@allwright.io](mailto:contact@allwright.io) and tell me about what you are working on — I am a freelance software engineer.
+For more advanced examples, check out the [crate documentation](https://docs.rs/web-rpc/latest/web_rpc/). Need help with your latest project? Get in touch via [contact@allwright.io](mailto:contact@allwright.io) and tell me about what you are working on - I am a available for new assignments.

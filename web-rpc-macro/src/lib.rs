@@ -52,6 +52,7 @@ struct Service {
 struct RpcMethod {
     is_async: Option<Token![async]>,
     attrs: Vec<Attribute>,
+    receiver: syn::Receiver,
     ident: Ident,
     args: Vec<PatType>,
     transfer: HashSet<Ident>,
@@ -171,6 +172,7 @@ impl<'a> ServiceGenerator<'a> {
             |RpcMethod {
                  attrs,
                  args,
+                 receiver,
                  ident,
                  is_async,
                  output,
@@ -180,7 +182,7 @@ impl<'a> ServiceGenerator<'a> {
                     if let Some(item_ty) = stream_item_type(ty) {
                         return quote_spanned! {ident.span()=>
                             #( #attrs )*
-                            #is_async fn #ident(&self, #( #args ),*) -> web_rpc::futures_channel::mpsc::UnboundedReceiver<#item_ty>;
+                            #is_async fn #ident(#receiver, #( #args ),*) -> web_rpc::futures_channel::mpsc::UnboundedReceiver<#item_ty>;
                         };
                     }
                 }
@@ -190,7 +192,7 @@ impl<'a> ServiceGenerator<'a> {
                 };
                 quote_spanned! {ident.span()=>
                     #( #attrs )*
-                    #is_async fn #ident(&self, #( #args ),*) -> #output;
+                    #is_async fn #ident(#receiver, #( #args ),*) -> #output;
                 }
             },
         );
@@ -201,6 +203,7 @@ impl<'a> ServiceGenerator<'a> {
                 |RpcMethod {
                      attrs,
                      args,
+                     receiver,
                      ident,
                      is_async,
                      output,
@@ -228,7 +231,7 @@ impl<'a> ServiceGenerator<'a> {
                         });
                         quote_spanned! {ident.span()=>
                             #( #attrs )*
-                            #is_async fn #ident(&self, #( #args ),*) -> #output {
+                            #is_async fn #ident(#receiver, #( #args ),*) -> #output {
                                 T::#ident(self, #( #forward_args ),*)#do_await
                             }
                         }
@@ -849,9 +852,10 @@ impl Parse for RpcMethod {
 
         let is_async = input.parse::<Token![async]>().ok();
         input.parse::<Token![fn]>()?;
-        let ident = input.parse()?;
+        let ident: Ident = input.parse()?;
         let content;
         parenthesized!(content in input);
+        let mut receiver: Option<syn::Receiver> = None;
         let mut args = Vec::new();
         for arg in content.parse_terminated::<FnArg, Comma>(FnArg::parse)? {
             match arg {
@@ -867,14 +871,33 @@ impl Parse for RpcMethod {
                         )
                     }
                 },
-                FnArg::Receiver(_) => {
-                    extend_errors!(
-                        errors,
-                        syn::Error::new(arg.span(), "receivers are not allowed in RPC arguments")
-                    );
+                FnArg::Receiver(ref recv) => {
+                    if recv.reference.is_none() || recv.mutability.is_some() {
+                        extend_errors!(
+                            errors,
+                            syn::Error::new(
+                                arg.span(),
+                                "RPC methods only support `&self` as a receiver"
+                            )
+                        );
+                    }
+                    receiver = Some(recv.clone());
                 }
             }
         }
+        let receiver = match receiver {
+            Some(r) => r,
+            None => {
+                extend_errors!(
+                    errors,
+                    syn::Error::new(
+                        ident.span(),
+                        "RPC methods must include `&self` as the first parameter"
+                    )
+                );
+                parse_quote!(&self)
+            }
+        };
         let output: ReturnType = input.parse()?;
         input.parse::<Token![;]>()?;
 
@@ -913,6 +936,7 @@ impl Parse for RpcMethod {
         Ok(Self {
             is_async,
             attrs,
+            receiver,
             ident,
             args,
             post,
@@ -925,8 +949,8 @@ impl Parse for RpcMethod {
 /// This attribute macro should applied to traits that need to be turned into RPCs. The
 /// macro will consume the trait and output three items in its place. For example,
 /// a trait `Calculator` will be replaced with two structs `CalculatorClient` and
-/// `CalculatorService` and a new trait by the same name with the methods which have had
-/// the a `&self` receiver added to them.
+/// `CalculatorService` and a new trait by the same name. All methods must include
+/// `&self` as their first parameter.
 #[proc_macro_attribute]
 pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let Service {

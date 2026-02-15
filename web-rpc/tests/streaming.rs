@@ -5,7 +5,7 @@ use wasm_bindgen_test::*;
 
 #[web_rpc::service]
 pub trait DataSource {
-    fn stream_data(count: u32) -> web_rpc::Stream<u32>;
+    fn stream_data(&self, count: u32) -> web_rpc::Stream<u32>;
 }
 
 struct DataSourceImpl;
@@ -68,8 +68,8 @@ async fn empty_stream() {
 /// Mixed methods: service with both unary and streaming methods
 #[web_rpc::service]
 pub trait Mixed {
-    fn add(left: u32, right: u32) -> u32;
-    fn stream_range(start: u32, end: u32) -> web_rpc::Stream<u32>;
+    fn add(&self, left: u32, right: u32) -> u32;
+    fn stream_range(&self, start: u32, end: u32) -> web_rpc::Stream<u32>;
 }
 
 struct MixedImpl;
@@ -115,7 +115,7 @@ async fn mixed_methods() {
 /// Slow streaming service for testing abort
 #[web_rpc::service]
 pub trait SlowStream {
-    async fn slow_count(target: u32, interval_ms: u32) -> web_rpc::Stream<u32>;
+    async fn slow_count(&self, target: u32, interval_ms: u32) -> web_rpc::Stream<u32>;
 }
 
 use std::{cell::RefCell, rc::Rc};
@@ -235,7 +235,7 @@ async fn close_and_drain() {
 /// Streaming with borrowed args
 #[web_rpc::service]
 pub trait BorrowedStream {
-    fn stream_prefixed(prefix: &str) -> web_rpc::Stream<String>;
+    fn stream_prefixed(&self, prefix: &str) -> web_rpc::Stream<String>;
 }
 
 struct BorrowedStreamImpl;
@@ -275,7 +275,7 @@ async fn streaming_with_borrowed_args() {
 #[web_rpc::service]
 pub trait PostStream {
     #[post(return)]
-    fn stream_js_strings(count: u32) -> web_rpc::Stream<js_sys::JsString>;
+    fn stream_js_strings(&self, count: u32) -> web_rpc::Stream<js_sys::JsString>;
 }
 
 struct PostStreamImpl;

@@ -4,7 +4,7 @@ use wasm_bindgen_test::*;
 /* define the service */
 #[web_rpc::service]
 pub trait Calculator {
-    fn add(left: u32, right: u32) -> u32;
+    fn add(&self, left: u32, right: u32) -> u32;
 }
 /* implement the server */
 struct CalculatorServiceImpl;

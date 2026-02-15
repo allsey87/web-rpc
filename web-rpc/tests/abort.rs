@@ -5,7 +5,7 @@ use wasm_bindgen_test::*;
 
 #[web_rpc::service]
 pub trait CountSlowly {
-    async fn count_slowly(target: u32, interval: Duration) -> u32;
+    async fn count_slowly(&self, target: u32, interval: Duration) -> u32;
 }
 
 impl CountSlowly for RefCell<u32> {
