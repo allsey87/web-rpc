@@ -3,7 +3,7 @@ members = ["web-rpc", "web-rpc-macro"]
 resolver = "2"
 
 [workspace.package]
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 authors = ["Michael Allwright <contact@allwright.io>"]
 description = "Bi-directional RPC for the Web"
