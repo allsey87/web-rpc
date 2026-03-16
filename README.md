@@ -49,4 +49,13 @@ let client = web_rpc::Builder::new(client_interface)
 assert_eq!(client.add(41, 1).await, 42);
 ```
 
+## Features
+- **Bidirectional RPC** over a single channel — both ends can be simultaneously client and server
+- **Posting and transferring JavaScript types** via the `#[post(...)]` and `#[post(transfer(...))]` attributes — types like `OffscreenCanvas` or `JsString` bypass serialization and are posted/transferred directly
+- **Optional and fallible JavaScript types** — posted types can be wrapped in `Option<JsType>` or `Result<JsOkType, JsErrType>` for both arguments and return types. `#[post(return)]` on a `Result` posts both the `Ok` and `Err` variants
+- **Streaming RPCs** — methods returning `impl Stream<Item = T>` stream items to the client, with support for abort-on-drop, close-and-drain, and `#[post(return)]`
+- **Async and sync methods** — async server methods run concurrently with per-request cancellation
+- **Notifications** — methods with no return type are fire-and-forget
+- **Borrowed parameters** — `&str` and `&[u8]` are deserialized zero-copy on the server
+
 For more advanced examples, check out the [crate documentation](https://docs.rs/web-rpc/latest/web_rpc/). Need help with your latest project? Get in touch via [contact@allwright.io](mailto:contact@allwright.io) and tell me about what you are working on - I am a available for new assignments.

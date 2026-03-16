@@ -155,6 +155,68 @@
 //!     );
 //! }
 //! ```
+//! ### Optional and fallible JavaScript types
+//! Posted JavaScript types can be wrapped in `Option` or `Result` to handle cases where
+//! a value may be absent or an operation may fail. This works for both arguments and
+//! return types, including streaming methods. When the value is `Some` or `Ok`, the
+//! JavaScript object is posted as usual. When the value is `None` or `Err`, no JavaScript
+//! object is sent — only a serialized discriminant travels over the wire.
+//!
+//! For example, a method that optionally returns a JavaScript string:
+//! ```rust
+//! #[web_rpc::service]
+//! pub trait Lookup {
+//!     #[post(return)]
+//!     fn find(&self, key: u32) -> Option<js_sys::JsString>;
+//! }
+//!
+//! struct LookupImpl;
+//! impl Lookup for LookupImpl {
+//!     fn find(&self, key: u32) -> Option<js_sys::JsString> {
+//!         if key == 42 {
+//!             Some(js_sys::JsString::from("found it"))
+//!         } else {
+//!             None
+//!         }
+//!     }
+//! }
+//! ```
+//! The client receives `RequestFuture<Option<js_sys::JsString>>` and can check
+//! whether the server returned a value.
+//!
+//! Similarly, a method that returns a `Result` where both the `Ok` and `Err` types
+//! are JavaScript objects can use `#[post(return)]` — both variants are posted:
+//! ```rust
+//! #[web_rpc::service]
+//! pub trait Parser {
+//!     #[post(return)]
+//!     fn parse(&self, input: String) -> Result<js_sys::JsString, js_sys::Error>;
+//! }
+//!
+//! struct ParserImpl;
+//! impl Parser for ParserImpl {
+//!     fn parse(&self, input: String) -> Result<js_sys::JsString, js_sys::Error> {
+//!         if input.is_empty() {
+//!             Err(js_sys::Error::new("empty input"))
+//!         } else {
+//!             Ok(js_sys::JsString::from(input.as_str()))
+//!         }
+//!     }
+//! }
+//! ```
+//! Arguments can also be optional JavaScript types:
+//! ```rust
+//! #[web_rpc::service]
+//! pub trait Formatter {
+//!     #[post(label)]
+//!     fn format(&self, label: Option<js_sys::JsString>) -> String;
+//! }
+//! ```
+//! All of these wrappers combine with streaming methods too — for example,
+//! `impl Stream<Item = Result<js_sys::JsString, String>>` with `#[post(return)]`
+//! will stream `Result` values where the `Ok` variant carries a posted JavaScript
+//! object and the `Err` variant carries a serialized error.
+//!
 //! ### Borrowed parameters
 //! RPC methods can accept borrowed types such as `&str` and `&[u8]`, which are deserialized
 //! zero-copy on the server side:

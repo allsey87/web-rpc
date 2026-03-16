@@ -48,6 +48,62 @@ fn stream_item_type(ty: &Type) -> Option<&Type> {
     None
 }
 
+/// If `ty` is `Option<T>`, returns Some(T).
+fn option_inner_type(ty: &Type) -> Option<&Type> {
+    if let Type::Path(type_path) = ty {
+        let last_seg = type_path.path.segments.last()?;
+        if last_seg.ident == "Option" {
+            if let syn::PathArguments::AngleBracketed(args) = &last_seg.arguments {
+                if args.args.len() == 1 {
+                    if let syn::GenericArgument::Type(inner) = &args.args[0] {
+                        return Some(inner);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// If `ty` is `Result<T, E>`, returns Some((T, E)).
+fn result_inner_types(ty: &Type) -> Option<(&Type, &Type)> {
+    if let Type::Path(type_path) = ty {
+        let last_seg = type_path.path.segments.last()?;
+        if last_seg.ident == "Result" {
+            if let syn::PathArguments::AngleBracketed(args) = &last_seg.arguments {
+                if args.args.len() == 2 {
+                    if let (syn::GenericArgument::Type(ok_ty), syn::GenericArgument::Type(err_ty)) =
+                        (&args.args[0], &args.args[1])
+                    {
+                        return Some((ok_ty, err_ty));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Describes how a posted type is wrapped.
+enum PostWrapperKind<'a> {
+    /// Bare JS type, e.g., `JsString`
+    Bare,
+    /// `Option<JsType>`
+    Option { inner_ty: &'a Type },
+    /// `Result<JsType, E>`
+    Result { ok_ty: &'a Type, err_ty: &'a Type },
+}
+
+fn post_wrapper_kind(ty: &Type) -> PostWrapperKind<'_> {
+    if let Some(inner) = option_inner_type(ty) {
+        PostWrapperKind::Option { inner_ty: inner }
+    } else if let Some((ok_ty, err_ty)) = result_inner_types(ty) {
+        PostWrapperKind::Result { ok_ty, err_ty }
+    } else {
+        PostWrapperKind::Bare
+    }
+}
+
 struct Service {
     attrs: Vec<Attribute>,
     vis: Visibility,
@@ -97,25 +153,34 @@ impl<'a> ServiceGenerator<'a> {
         };
         let variants = rpcs.iter().zip(camel_case_idents.iter()).map(
             |(RpcMethod { args, post, .. }, camel_case_ident)| {
-                let fields = args
-                    .iter()
-                    .filter(|arg| {
-                        matches!(&*arg.pat, Pat::Ident(ident) if !post.contains(&ident.ident))
-                    })
-                    .map(|arg| {
-                        if has_borrowed_args {
+                let fields = args.iter().filter_map(|arg| {
+                    let is_post =
+                        matches!(&*arg.pat, Pat::Ident(ident) if post.contains(&ident.ident));
+                    if is_post {
+                        // For wrapped post args, include a discriminant field
+                        let pat = &arg.pat;
+                        match post_wrapper_kind(&arg.ty) {
+                            PostWrapperKind::Option { .. } => Some(quote! { #pat: bool }),
+                            PostWrapperKind::Result { .. } => Some(quote! { #pat: bool }),
+                            PostWrapperKind::Bare => None, // bare post args excluded
+                        }
+                    } else {
+                        // Non-post args included as-is (with lifetime fix for borrowed)
+                        Some(if has_borrowed_args {
                             if let Type::Reference(type_ref) = &*arg.ty {
                                 let mut type_ref = type_ref.clone();
-                                type_ref.lifetime = Some(Lifetime::new(
-                                    "'a",
-                                    type_ref.and_token.span(),
-                                ));
+                                type_ref.lifetime =
+                                    Some(Lifetime::new("'a", type_ref.and_token.span()));
                                 let pat = &arg.pat;
-                                return quote! { #pat: #type_ref };
+                                quote! { #pat: #type_ref }
+                            } else {
+                                quote! { #arg }
                             }
-                        }
-                        quote! { #arg }
-                    });
+                        } else {
+                            quote! { #arg }
+                        })
+                    }
+                });
                 quote! {
                     #camel_case_ident { #( #fields ),* }
                 }
@@ -149,6 +214,21 @@ impl<'a> ServiceGenerator<'a> {
                         quote! {
                             #camel_case_ident ( #ty )
                         }
+                    }
+                }
+                ReturnType::Type(_, ty) => {
+                    // post(return) — determine the effective type (stream item or raw return)
+                    let effective_ty = stream_item_type(ty).unwrap_or(ty);
+                    match post_wrapper_kind(effective_ty) {
+                        PostWrapperKind::Bare => quote! {
+                            #camel_case_ident ( () )
+                        },
+                        PostWrapperKind::Option { .. } => quote! {
+                            #camel_case_ident ( bool )
+                        },
+                        PostWrapperKind::Result { .. } => quote! {
+                            #camel_case_ident ( bool )
+                        },
                     }
                 }
                 _ => quote! {
@@ -281,22 +361,154 @@ impl<'a> ServiceGenerator<'a> {
             .iter()
             .zip(camel_case_idents.iter())
             .map(|(RpcMethod { attrs, args, transfer, post, ident, output, .. }, camel_case_ident)| {
-                /* sort arguments based on post and transfer attributes */
-                let serialize_arg_idents = args.iter()
+                // Build request struct fields — non-post args use ident directly,
+                // wrapped post args use a discriminant value
+                let request_struct_fields: Vec<_> = args.iter()
                     .filter_map(|arg| match &*arg.pat {
-                        Pat::Ident(ident) if !post.contains(&ident.ident) => Some(&ident.ident),
+                        Pat::Ident(pat_ident) => {
+                            let id = &pat_ident.ident;
+                            if post.contains(id) {
+                                match post_wrapper_kind(&arg.ty) {
+                                    PostWrapperKind::Bare => None,
+                                    PostWrapperKind::Option { .. } => {
+                                        Some(quote! { #id: #id.is_some() })
+                                    }
+                                    PostWrapperKind::Result { .. } => {
+                                        Some(quote! { #id: #id.is_ok() })
+                                    }
+                                }
+                            } else {
+                                Some(quote! { #id })
+                            }
+                        }
                         _ => None
-                    });
-                let post_arg_idents = args.iter()
+                    })
+                    .collect();
+
+                // Build JS post/transfer array pushes — bare post args always push,
+                // wrapped post args conditionally push
+                let post_pushes: Vec<_> = args.iter()
                     .filter_map(|arg| match &*arg.pat {
-                        Pat::Ident(ident) if post.contains(&ident.ident) => Some(&ident.ident),
+                        Pat::Ident(pat_ident) if post.contains(&pat_ident.ident) => {
+                            let id = &pat_ident.ident;
+                            let is_transfer = transfer.contains(&pat_ident.ident);
+                            match post_wrapper_kind(&arg.ty) {
+                                PostWrapperKind::Bare => {
+                                    let transfer_push = if is_transfer {
+                                        quote! { __transfer.push(#id.as_ref()); }
+                                    } else {
+                                        quote! {}
+                                    };
+                                    Some(quote! {
+                                        __post.push(#id.as_ref());
+                                        #transfer_push
+                                    })
+                                }
+                                PostWrapperKind::Option { .. } => {
+                                    let transfer_push = if is_transfer {
+                                        quote! { __transfer.push(__val.as_ref()); }
+                                    } else {
+                                        quote! {}
+                                    };
+                                    Some(quote! {
+                                        if let Some(ref __val) = #id {
+                                            __post.push(__val.as_ref());
+                                            #transfer_push
+                                        }
+                                    })
+                                }
+                                PostWrapperKind::Result { .. } => {
+                                    let transfer_push = if is_transfer {
+                                        quote! { __transfer.push(__val.as_ref()); }
+                                    } else {
+                                        quote! {}
+                                    };
+                                    Some(quote! {
+                                        match #id {
+                                            Ok(ref __val) => {
+                                                __post.push(__val.as_ref());
+                                                #transfer_push
+                                            }
+                                            Err(ref __val) => {
+                                                __post.push(__val.as_ref());
+                                                #transfer_push
+                                            }
+                                        }
+                                    })
+                                }
+                            }
+                        }
                         _ => None
-                    });
-                let transfer_arg_idents = args.iter()
+                    })
+                    .collect();
+
+                // Static transfer args (bare post args that are also transfer)
+                let bare_transfer_arg_idents: Vec<_> = args.iter()
                     .filter_map(|arg| match &*arg.pat {
-                        Pat::Ident(ident) if transfer.contains(&ident.ident) => Some(&ident.ident),
+                        Pat::Ident(pat_ident) if transfer.contains(&pat_ident.ident)
+                            && matches!(post_wrapper_kind(&arg.ty), PostWrapperKind::Bare) =>
+                        {
+                            Some(&pat_ident.ident)
+                        }
                         _ => None
-                    });
+                    })
+                    .collect();
+
+                let has_wrapped_post_args = args.iter().any(|arg| {
+                    matches!(&*arg.pat, Pat::Ident(pat_ident)
+                        if post.contains(&pat_ident.ident)
+                        && !matches!(post_wrapper_kind(&arg.ty), PostWrapperKind::Bare))
+                });
+
+                // Generate the send_request code
+                let send_request = if has_wrapped_post_args {
+                    // Use incremental push for post/transfer arrays
+                    quote! {
+                        let __seq_id = self.seq_id.replace_with(|seq_id| seq_id.wrapping_add(1));
+                        let __request = #request_ident::#camel_case_ident {
+                            #( #request_struct_fields ),*
+                        };
+                        let __header = web_rpc::MessageHeader::Request(__seq_id);
+                        let __header_bytes = web_rpc::bincode::serialize(&__header).unwrap();
+                        let __header_buffer = web_rpc::js_sys::Uint8Array::from(&__header_bytes[..]).buffer();
+                        let __payload_bytes = web_rpc::bincode::serialize(&__request).unwrap();
+                        let __payload_buffer = web_rpc::js_sys::Uint8Array::from(&__payload_bytes[..]).buffer();
+                        let __post = web_rpc::js_sys::Array::new();
+                        let __transfer = web_rpc::js_sys::Array::new();
+                        __post.push(__header_buffer.as_ref());
+                        __post.push(__payload_buffer.as_ref());
+                        __transfer.push(__header_buffer.as_ref());
+                        __transfer.push(__payload_buffer.as_ref());
+                        #( #post_pushes )*
+                        self.port.post_message(&__post, &__transfer).unwrap();
+                    }
+                } else {
+                    // Original slice-literal approach for bare post args
+                    let bare_post_arg_idents: Vec<_> = args.iter()
+                        .filter_map(|arg| match &*arg.pat {
+                            Pat::Ident(pat_ident) if post.contains(&pat_ident.ident) => Some(&pat_ident.ident),
+                            _ => None
+                        })
+                        .collect();
+                    quote! {
+                        let __seq_id = self.seq_id.replace_with(|seq_id| seq_id.wrapping_add(1));
+                        let __request = #request_ident::#camel_case_ident {
+                            #( #request_struct_fields ),*
+                        };
+                        let __header = web_rpc::MessageHeader::Request(__seq_id);
+                        let __header_bytes = web_rpc::bincode::serialize(&__header).unwrap();
+                        let __header_buffer = web_rpc::js_sys::Uint8Array::from(&__header_bytes[..]).buffer();
+                        let __payload_bytes = web_rpc::bincode::serialize(&__request).unwrap();
+                        let __payload_buffer = web_rpc::js_sys::Uint8Array::from(&__payload_bytes[..]).buffer();
+                        let __post: &[&web_rpc::wasm_bindgen::JsValue] =
+                            &[__header_buffer.as_ref(), __payload_buffer.as_ref(), #( #bare_post_arg_idents.as_ref() ),*];
+                        let __post = web_rpc::js_sys::Array::from_iter(__post);
+                        let __transfer: &[&web_rpc::wasm_bindgen::JsValue] =
+                            &[__header_buffer.as_ref(), __payload_buffer.as_ref(), #( #bare_transfer_arg_idents.as_ref() ),*];
+                        let __transfer = web_rpc::js_sys::Array::from_iter(__transfer);
+                        self.port.post_message(&__post, &__transfer).unwrap();
+                    }
+                };
 
                 // Check if this is a streaming method
                 let is_streaming = matches!(output, ReturnType::Type(_, ref ty) if stream_item_type(ty).is_some());
@@ -307,32 +519,41 @@ impl<'a> ServiceGenerator<'a> {
                         _ => unreachable!(),
                     };
 
-                    // Common: send the request
-                    let send_request = quote! {
-                        let __seq_id = self.seq_id.replace_with(|seq_id| seq_id.wrapping_add(1));
-                        let __request = #request_ident::#camel_case_ident {
-                            #( #serialize_arg_idents ),*
-                        };
-                        let __header = web_rpc::MessageHeader::Request(__seq_id);
-                        let __header_bytes = web_rpc::bincode::serialize(&__header).unwrap();
-                        let __header_buffer = web_rpc::js_sys::Uint8Array::from(&__header_bytes[..]).buffer();
-                        let __payload_bytes = web_rpc::bincode::serialize(&__request).unwrap();
-                        let __payload_buffer = web_rpc::js_sys::Uint8Array::from(&__payload_bytes[..]).buffer();
-                        let __post: &[&web_rpc::wasm_bindgen::JsValue] =
-                            &[__header_buffer.as_ref(), __payload_buffer.as_ref(), #( #post_arg_idents.as_ref() ),*];
-                        let __post = web_rpc::js_sys::Array::from_iter(__post);
-                        let __transfer: &[&web_rpc::wasm_bindgen::JsValue] =
-                            &[__header_buffer.as_ref(), __payload_buffer.as_ref(), #( #transfer_arg_idents.as_ref() ),*];
-                        let __transfer = web_rpc::js_sys::Array::from_iter(__transfer);
-                        self.port.post_message(&__post, &__transfer).unwrap();
-                    };
-
                     let unpack_stream_item = if post.contains(&Ident::new("return", output.span())) {
-                        quote! {
-                            |(_response, __post_array)| {
-                                web_rpc::wasm_bindgen::JsCast::dyn_into::<#item_ty>(__post_array.shift())
-                                    .unwrap()
-                            }
+                        match post_wrapper_kind(item_ty) {
+                            PostWrapperKind::Bare => quote! {
+                                |(_response, __post_array)| {
+                                    web_rpc::wasm_bindgen::JsCast::dyn_into::<#item_ty>(__post_array.shift())
+                                        .unwrap()
+                                }
+                            },
+                            PostWrapperKind::Option { inner_ty } => quote! {
+                                |(__response, __post_array)| {
+                                    let #response_ident::#camel_case_ident(__has_value) = __response else {
+                                        panic!("received incorrect response variant")
+                                    };
+                                    if __has_value {
+                                        Some(web_rpc::wasm_bindgen::JsCast::dyn_into::<#inner_ty>(__post_array.shift())
+                                            .unwrap())
+                                    } else {
+                                        None
+                                    }
+                                }
+                            },
+                            PostWrapperKind::Result { ok_ty, err_ty } => quote! {
+                                |(__response, __post_array)| {
+                                    let #response_ident::#camel_case_ident(__is_ok) = __response else {
+                                        panic!("received incorrect response variant")
+                                    };
+                                    if __is_ok {
+                                        Ok(web_rpc::wasm_bindgen::JsCast::dyn_into::<#ok_ty>(__post_array.shift())
+                                            .unwrap())
+                                    } else {
+                                        Err(web_rpc::wasm_bindgen::JsCast::dyn_into::<#err_ty>(__post_array.shift())
+                                            .unwrap())
+                                    }
+                                }
+                            },
                         }
                     } else {
                         quote! {
@@ -390,14 +611,41 @@ impl<'a> ServiceGenerator<'a> {
 
                     let unpack_response = if post.contains(&Ident::new("return", output.span())) {
                         let unit_output: &Type = &parse_quote!(());
-                        let output = match output {
+                        let ret_ty = match output {
                             ReturnType::Type(_, ref ty) => ty,
                             _ => unit_output
                         };
-                        quote! {
-                            let (_, __post_response) = response;
-                            web_rpc::wasm_bindgen::JsCast::dyn_into::<#output>(__post_response.shift())
-                                .unwrap()
+                        match post_wrapper_kind(ret_ty) {
+                            PostWrapperKind::Bare => quote! {
+                                let (_, __post_response) = response;
+                                web_rpc::wasm_bindgen::JsCast::dyn_into::<#ret_ty>(__post_response.shift())
+                                    .unwrap()
+                            },
+                            PostWrapperKind::Option { inner_ty } => quote! {
+                                let (__serialize_response, __post_response) = response;
+                                let #response_ident::#camel_case_ident(__has_value) = __serialize_response else {
+                                    panic!("received incorrect response variant")
+                                };
+                                if __has_value {
+                                    Some(web_rpc::wasm_bindgen::JsCast::dyn_into::<#inner_ty>(__post_response.shift())
+                                        .unwrap())
+                                } else {
+                                    None
+                                }
+                            },
+                            PostWrapperKind::Result { ok_ty, err_ty } => quote! {
+                                let (__serialize_response, __post_response) = response;
+                                let #response_ident::#camel_case_ident(__is_ok) = __serialize_response else {
+                                    panic!("received incorrect response variant")
+                                };
+                                if __is_ok {
+                                    Ok(web_rpc::wasm_bindgen::JsCast::dyn_into::<#ok_ty>(__post_response.shift())
+                                        .unwrap())
+                                } else {
+                                    Err(web_rpc::wasm_bindgen::JsCast::dyn_into::<#err_ty>(__post_response.shift())
+                                        .unwrap())
+                                }
+                            },
                         }
                     } else {
                         quote! {
@@ -434,23 +682,8 @@ impl<'a> ServiceGenerator<'a> {
                             &self,
                             #( #args ),*
                         ) -> #return_type {
-                            let __seq_id = self.seq_id.replace_with(|seq_id| seq_id.wrapping_add(1));
-                            let __request = #request_ident::#camel_case_ident {
-                                #( #serialize_arg_idents ),*
-                            };
-                            let __header = web_rpc::MessageHeader::Request(__seq_id);
-                            let __header_bytes = web_rpc::bincode::serialize(&__header).unwrap();
-                            let __header_buffer = web_rpc::js_sys::Uint8Array::from(&__header_bytes[..]).buffer();
-                            let __payload_bytes = web_rpc::bincode::serialize(&__request).unwrap();
-                            let __payload_buffer = web_rpc::js_sys::Uint8Array::from(&__payload_bytes[..]).buffer();
-                            let __post: &[&web_rpc::wasm_bindgen::JsValue] =
-                                &[__header_buffer.as_ref(), __payload_buffer.as_ref(), #( #post_arg_idents.as_ref() ),*];
-                            let __post = web_rpc::js_sys::Array::from_iter(__post);
-                            let __transfer: &[&web_rpc::wasm_bindgen::JsValue] =
-                                &[__header_buffer.as_ref(), __payload_buffer.as_ref(), #( #transfer_arg_idents.as_ref() ),*];
-                            let __transfer = web_rpc::js_sys::Array::from_iter(__transfer);
+                            #send_request
                             #maybe_register_callback
-                            self.port.post_message(&__post, &__transfer).unwrap();
                             #maybe_unpack_and_return_future
                         }
                     }
@@ -550,29 +783,71 @@ impl<'a> ServiceGenerator<'a> {
         let handlers = rpcs.iter()
             .zip(camel_case_idents.iter())
             .map(|(RpcMethod { is_async, ident, args, transfer, post, output, .. }, camel_case_ident)| {
-                let serialize_arg_idents = args.iter()
+                // Collect idents for request enum destructuring — non-post args
+                // plus wrapped post args (which are now bool/Result<(), E> discriminants)
+                let destructure_arg_idents: Vec<_> = args.iter()
                     .filter_map(|arg| match &*arg.pat {
-                        Pat::Ident(ident) if !post.contains(&ident.ident) => Some(&ident.ident),
+                        Pat::Ident(pat_ident) => {
+                            let id = &pat_ident.ident;
+                            if post.contains(id) {
+                                // Only include if wrapped (bare post args are not in the enum)
+                                match post_wrapper_kind(&arg.ty) {
+                                    PostWrapperKind::Bare => None,
+                                    _ => Some(id),
+                                }
+                            } else {
+                                Some(id)
+                            }
+                        }
                         _ => None
-                    });
+                    })
+                    .collect();
                 let extract_js_args = args.iter()
                     .filter_map(|arg| match &*arg.pat {
                         Pat::Ident(pat_ident) if post.contains(&pat_ident.ident) => {
                             let arg_pat = &arg.pat;
                             let arg_ty = &arg.ty;
-                            if let Type::Reference(type_ref) = &**arg_ty {
-                                let inner_ty = &type_ref.elem;
-                                let tmp_ident = format_ident!("__tmp_{}", pat_ident.ident);
-                                Some(quote! {
-                                    let #tmp_ident = __js_args.shift();
-                                    let #arg_pat: #arg_ty = web_rpc::wasm_bindgen::JsCast::dyn_ref::<#inner_ty>(&#tmp_ident)
-                                        .unwrap();
-                                })
-                            } else {
-                                Some(quote! {
-                                    let #arg_pat = web_rpc::wasm_bindgen::JsCast::dyn_into::<#arg_ty>(__js_args.shift())
-                                        .unwrap();
-                                })
+                            match post_wrapper_kind(arg_ty) {
+                                PostWrapperKind::Bare => {
+                                    // Original logic for bare post args
+                                    if let Type::Reference(type_ref) = &**arg_ty {
+                                        let inner_ty = &type_ref.elem;
+                                        let tmp_ident = format_ident!("__tmp_{}", pat_ident.ident);
+                                        Some(quote! {
+                                            let #tmp_ident = __js_args.shift();
+                                            let #arg_pat: #arg_ty = web_rpc::wasm_bindgen::JsCast::dyn_ref::<#inner_ty>(&#tmp_ident)
+                                                .unwrap();
+                                        })
+                                    } else {
+                                        Some(quote! {
+                                            let #arg_pat = web_rpc::wasm_bindgen::JsCast::dyn_into::<#arg_ty>(__js_args.shift())
+                                                .unwrap();
+                                        })
+                                    }
+                                }
+                                PostWrapperKind::Option { inner_ty } => {
+                                    // `arg_pat` is already bound as bool from destructuring
+                                    // Shadow it with the reconstructed Option
+                                    Some(quote! {
+                                        let #arg_pat: #arg_ty = if #arg_pat {
+                                            Some(web_rpc::wasm_bindgen::JsCast::dyn_into::<#inner_ty>(__js_args.shift())
+                                                .unwrap())
+                                        } else {
+                                            None
+                                        };
+                                    })
+                                }
+                                PostWrapperKind::Result { ok_ty, .. } => {
+                                    // `arg_pat` is already bound as Result<(), E> from destructuring
+                                    // Shadow it with the reconstructed Result
+                                    Some(quote! {
+                                        let #arg_pat: #arg_ty = match #arg_pat {
+                                            Ok(()) => Ok(web_rpc::wasm_bindgen::JsCast::dyn_into::<#ok_ty>(__js_args.shift())
+                                                .unwrap()),
+                                            Err(__e) => Err(__e),
+                                        };
+                                    })
+                                }
                             }
                         },
                         _ => None
@@ -587,22 +862,78 @@ impl<'a> ServiceGenerator<'a> {
                         _ => None
                     });
                     let return_ident = Ident::new("return", output.span());
-                    let wrap_item = match (post.contains(&return_ident), transfer.contains(&return_ident)) {
-                        (false, _) => quote! {
+                    let is_post_return = post.contains(&return_ident);
+                    let is_transfer_return = transfer.contains(&return_ident);
+                    let item_ty = match output {
+                        ReturnType::Type(_, ref ty) => stream_item_type(ty).unwrap(),
+                        _ => unreachable!(),
+                    };
+                    let wrap_item = if !is_post_return {
+                        quote! {
                             let __response = #response_ident::#camel_case_ident(__item);
                             let __post = web_rpc::js_sys::Array::new();
                             let __transfer = web_rpc::js_sys::Array::new();
-                        },
-                        (true, false) => quote! {
-                            let __response = #response_ident::#camel_case_ident(());
-                            let __post = web_rpc::js_sys::Array::of1(__item.as_ref());
-                            let __transfer = web_rpc::js_sys::Array::new();
-                        },
-                        (true, true) => quote! {
-                            let __response = #response_ident::#camel_case_ident(());
-                            let __post = web_rpc::js_sys::Array::of1(__item.as_ref());
-                            let __transfer = web_rpc::js_sys::Array::of1(__item.as_ref());
-                        },
+                        }
+                    } else {
+                        let wrapper_kind = post_wrapper_kind(item_ty);
+                        match wrapper_kind {
+                            PostWrapperKind::Bare => {
+                                let transfer_code = if is_transfer_return {
+                                    quote! { web_rpc::js_sys::Array::of1(__item.as_ref()) }
+                                } else {
+                                    quote! { web_rpc::js_sys::Array::new() }
+                                };
+                                quote! {
+                                    let __response = #response_ident::#camel_case_ident(());
+                                    let __post = web_rpc::js_sys::Array::of1(__item.as_ref());
+                                    let __transfer = #transfer_code;
+                                }
+                            }
+                            PostWrapperKind::Option { .. } => {
+                                let transfer_push = if is_transfer_return {
+                                    quote! { __transfer.push(__val.as_ref()); }
+                                } else {
+                                    quote! {}
+                                };
+                                quote! {
+                                    let (__response, __post, __transfer) = match __item {
+                                        Some(ref __val) => {
+                                            let __post = web_rpc::js_sys::Array::of1(__val.as_ref());
+                                            let __transfer = web_rpc::js_sys::Array::new();
+                                            #transfer_push
+                                            (#response_ident::#camel_case_ident(true), __post, __transfer)
+                                        }
+                                        None => {
+                                            (#response_ident::#camel_case_ident(false),
+                                             web_rpc::js_sys::Array::new(),
+                                             web_rpc::js_sys::Array::new())
+                                        }
+                                    };
+                                }
+                            }
+                            PostWrapperKind::Result { .. } => {
+                                let transfer_push = if is_transfer_return {
+                                    quote! { __transfer.push(__val.as_ref()); }
+                                } else {
+                                    quote! {}
+                                };
+                                quote! {
+                                    let (__response, __post, __transfer) = match __item {
+                                        Ok(ref __val) => {
+                                            let __post = web_rpc::js_sys::Array::of1(__val.as_ref());
+                                            let __transfer = web_rpc::js_sys::Array::new();
+                                            #transfer_push
+                                            (#response_ident::#camel_case_ident(true), __post, __transfer)
+                                        }
+                                        Err(ref __val) => {
+                                            let __post = web_rpc::js_sys::Array::of1(__val.as_ref());
+                                            let __transfer = web_rpc::js_sys::Array::new();
+                                            (#response_ident::#camel_case_ident(false), __post, __transfer)
+                                        }
+                                    };
+                                }
+                            }
+                        }
                     };
                     // Build the forwarding closure (reused for both async/sync)
                     let fwd_body = quote! {
@@ -628,7 +959,7 @@ impl<'a> ServiceGenerator<'a> {
 
                     match is_async {
                         Some(_) => quote! {
-                            #request_ident::#camel_case_ident { #( #serialize_arg_idents ),* } => {
+                            #request_ident::#camel_case_ident { #( #destructure_arg_idents ),* } => {
                                 #( #extract_js_args )*
                                 let __get_rx = web_rpc::futures_util::FutureExt::fuse(
                                     self.server_impl.#ident(#( #call_args ),*)
@@ -647,7 +978,7 @@ impl<'a> ServiceGenerator<'a> {
                             }
                         },
                         None => quote! {
-                            #request_ident::#camel_case_ident { #( #serialize_arg_idents ),* } => {
+                            #request_ident::#camel_case_ident { #( #destructure_arg_idents ),* } => {
                                 #( #extract_js_args )*
                                 let mut __user_rx = self.server_impl.#ident(#( #call_args ),*);
                                 #fwd_body
@@ -657,21 +988,78 @@ impl<'a> ServiceGenerator<'a> {
                 } else {
                     // Non-streaming (original logic, but wrapped in ExecuteResult::Response)
                     let return_ident = Ident::new("return", output.span());
-                    let return_response = match (post.contains(&return_ident), transfer.contains(&return_ident)) {
-                        (false, _) => quote! {
+                    let is_post_return = post.contains(&return_ident);
+                    let is_transfer_return = transfer.contains(&return_ident);
+                    let ret_ty = match output {
+                        ReturnType::Type(_, ref ty) => Some(ty.as_ref()),
+                        _ => None,
+                    };
+                    let return_response = if !is_post_return {
+                        quote! {
                             let __post = web_rpc::js_sys::Array::new();
                             let __transfer = web_rpc::js_sys::Array::new();
                             (#response_ident::#camel_case_ident(__response), __post, __transfer)
-                        },
-                        (true, false) => quote! {
-                            let __post = web_rpc::js_sys::Array::of1(__response.as_ref());
-                            let __transfer = web_rpc::js_sys::Array::new();
-                            (#response_ident::#camel_case_ident(()), __post, __transfer)
-                        },
-                        (true, true) => quote! {
-                            let __post = web_rpc::js_sys::Array::of1(__response.as_ref());
-                            let __transfer = web_rpc::js_sys::Array::of1(__response.as_ref());
-                            (#response_ident::#camel_case_ident(()), __post, __transfer)
+                        }
+                    } else {
+                        let wrapper_kind = ret_ty.map(|ty| post_wrapper_kind(ty));
+                        match wrapper_kind {
+                            Some(PostWrapperKind::Option { .. }) => {
+                                let transfer_push = if is_transfer_return {
+                                    quote! { __transfer.push(__val.as_ref()); }
+                                } else {
+                                    quote! {}
+                                };
+                                quote! {
+                                    match __response {
+                                        Some(ref __val) => {
+                                            let __post = web_rpc::js_sys::Array::of1(__val.as_ref());
+                                            let __transfer = web_rpc::js_sys::Array::new();
+                                            #transfer_push
+                                            (#response_ident::#camel_case_ident(true), __post, __transfer)
+                                        }
+                                        None => {
+                                            (#response_ident::#camel_case_ident(false),
+                                             web_rpc::js_sys::Array::new(),
+                                             web_rpc::js_sys::Array::new())
+                                        }
+                                    }
+                                }
+                            }
+                            Some(PostWrapperKind::Result { .. }) => {
+                                let transfer_push = if is_transfer_return {
+                                    quote! { __transfer.push(__val.as_ref()); }
+                                } else {
+                                    quote! {}
+                                };
+                                quote! {
+                                    match __response {
+                                        Ok(ref __val) => {
+                                            let __post = web_rpc::js_sys::Array::of1(__val.as_ref());
+                                            let __transfer = web_rpc::js_sys::Array::new();
+                                            #transfer_push
+                                            (#response_ident::#camel_case_ident(true), __post, __transfer)
+                                        }
+                                        Err(ref __val) => {
+                                            let __post = web_rpc::js_sys::Array::of1(__val.as_ref());
+                                            let __transfer = web_rpc::js_sys::Array::new();
+                                            (#response_ident::#camel_case_ident(false), __post, __transfer)
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                // Bare post return
+                                let transfer_code = if is_transfer_return {
+                                    quote! { web_rpc::js_sys::Array::of1(__response.as_ref()) }
+                                } else {
+                                    quote! { web_rpc::js_sys::Array::new() }
+                                };
+                                quote! {
+                                    let __post = web_rpc::js_sys::Array::of1(__response.as_ref());
+                                    let __transfer = #transfer_code;
+                                    (#response_ident::#camel_case_ident(()), __post, __transfer)
+                                }
+                            }
                         }
                     };
                     let call_args = args.iter().filter_map(|arg| match &*arg.pat {
@@ -680,7 +1068,7 @@ impl<'a> ServiceGenerator<'a> {
                     });
                     match is_async {
                         Some(_) => quote! {
-                            #request_ident::#camel_case_ident { #( #serialize_arg_idents ),* } => {
+                            #request_ident::#camel_case_ident { #( #destructure_arg_idents ),* } => {
                                 #( #extract_js_args )*
                                 let __task =
                                     web_rpc::futures_util::FutureExt::fuse(self.server_impl.#ident(#( #call_args ),*));
@@ -696,7 +1084,7 @@ impl<'a> ServiceGenerator<'a> {
                             }
                         },
                         None => quote! {
-                            #request_ident::#camel_case_ident { #( #serialize_arg_idents ),* } => {
+                            #request_ident::#camel_case_ident { #( #destructure_arg_idents ),* } => {
                                 #( #extract_js_args )*
                                 let __response = self.server_impl.#ident(#( #call_args ),*);
                                 web_rpc::service::ExecuteResult::Response(

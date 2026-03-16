@@ -126,11 +126,7 @@ struct SlowStreamImpl {
 }
 
 impl SlowStream for SlowStreamImpl {
-    async fn slow_count(
-        &self,
-        target: u32,
-        interval_ms: u32,
-    ) -> impl Stream<Item = u32> {
+    async fn slow_count(&self, target: u32, interval_ms: u32) -> impl Stream<Item = u32> {
         let (tx, rx) = futures_channel::mpsc::unbounded();
         let count = self.count.clone();
         let interval = Duration::from_millis(interval_ms as u64);
@@ -281,10 +277,7 @@ pub trait PostStream {
 
 struct PostStreamImpl;
 impl PostStream for PostStreamImpl {
-    fn stream_js_strings(
-        &self,
-        count: u32,
-    ) -> impl Stream<Item = js_sys::JsString> {
+    fn stream_js_strings(&self, count: u32) -> impl Stream<Item = js_sys::JsString> {
         let (tx, rx) = futures_channel::mpsc::unbounded();
         for i in 0..count {
             let _ = tx.unbounded_send(js_sys::JsString::from(format!("item-{}", i)));
