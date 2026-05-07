@@ -268,10 +268,9 @@ async fn streaming_with_borrowed_args() {
     assert_eq!(items, vec!["hello-0", "hello-1", "hello-2"]);
 }
 
-/// Streaming with #[post(return)] — JS values bypass serialization
+/// Streaming JS values — auto-detected as posted (no attribute needed).
 #[web_rpc::service]
 pub trait PostStream {
-    #[post(return)]
     fn stream_js_strings(&self, count: u32) -> impl Stream<Item = js_sys::JsString>;
 }
 

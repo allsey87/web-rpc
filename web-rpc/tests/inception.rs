@@ -16,7 +16,7 @@ impl FortyTwo for FortyTwoServiceImpl {
 
 #[web_rpc::service]
 pub trait Channel {
-    #[post(transfer(return))]
+    #[transfer(return)]
     fn start(&self) -> web_sys::MessagePort;
 }
 

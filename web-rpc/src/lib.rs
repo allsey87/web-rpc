@@ -1,305 +1,146 @@
-//! The `web-rpc` create is a library for performing RPCs (remote proceedure calls) between
-//! browsing contexts, web workers, and channels. It allows you to define an RPC using a trait
-//! similar to Google's [tarpc](https://github.com/google/tarpc) and will transparently
-//! handle the serialization and deserialization of the arguments. Moreover, it can post
-//! anything that implements [`AsRef<JsValue>`](https://docs.rs/wasm-bindgen/latest/wasm_bindgen/struct.JsValue.html) and also supports transferring ownership.
+//! Bidirectional RPC for browsing contexts, web workers, and message channels.
 //!
-//! ## Quick start
-//! To get started define a trait for your RPC service as follows. Annnotate this trait with the
-//! `service` procedural macro that is exported by this crate:
+//! This crate allows you to define a service as a trait and annotate it with
+//! [`#[web_rpc::service]`](macro@service). The macro then produces a `*Client`, a `*Service`,
+//! and a forwarding trait that you can implement on the server side.
+//!
+//! Routing is inferred from each type: anything implementing
+//! [`AsRef<JsValue>`](https://docs.rs/wasm-bindgen/latest/wasm_bindgen/struct.JsValue.html) is
+//! posted through `postMessage` directly and everything that is serializable is first encoded
+//! via bincode. There is special support for `Option<T>` and `Result<T, E>` to allow Javascript
+//! types to be embedded within these types. This behaviour is recursive.
+//!
+//! # Quickstart
 //! ```rust
 //! #[web_rpc::service]
 //! pub trait Calculator {
 //!     fn add(&self, left: u32, right: u32) -> u32;
 //! }
-//! ```
-//! This macro will generate the structs `CalculatorClient`, `CalculatorService`, and a new trait
-//! `Calculator` that you can use to implement the service as follows:
-//! ```rust
-//! # #[web_rpc::service]
-//! # pub trait Calculator {
-//! #     fn add(&self, left: u32, right: u32) -> u32;
-//! # }
-//! struct CalculatorServiceImpl;
-//!
-//! impl Calculator for CalculatorServiceImpl {
-//!     fn add(&self, left: u32, right: u32) -> u32 {
-//!         left + right
-//!     }
+//! struct Calc;
+//! impl Calculator for Calc {
+//!     fn add(&self, left: u32, right: u32) -> u32 { left + right }
 //! }
 //! ```
-//! Note that the `&self` receiver is required in the trait definition. Although not
-//! used in this example, this is useful when we want the RPC to modify some state (via interior
-//! mutability). Now that we have defined our RPC, let's create a client and server for it! In this
-//! example, we will use [`MessageChannel`](https://docs.rs/web-sys/latest/web_sys/struct.MessageChannel.html)
-//! since it is easy to construct and test, however, a more common case would be to construct the
-//! channel from a [`Worker`](https://docs.rs/web-sys/latest/web_sys/struct.Worker.html) or a
-//! [`DedicatedWorkerGlobalScope`](https://docs.rs/web-sys/latest/web_sys/struct.DedicatedWorkerGlobalScope.html).
-//! Let's start by defining the server:
+//! Wire up over a `MessageChannel`, [`Worker`](https://docs.rs/web-sys/latest/web_sys/struct.Worker.html),
+//! or any [`MessagePort`](https://docs.rs/web-sys/latest/web_sys/struct.MessagePort.html). Each
+//! Each call to [`Interface::new`] is async because temporary listeners need to detect when
+//! both ends are ready.
 //! ```rust,no_run
 //! # #[web_rpc::service]
-//! # pub trait Calculator {
-//! #     fn add(&self, left: u32, right: u32) -> u32;
-//! # }
-//! # struct CalculatorServiceImpl;
-//! # impl Calculator for CalculatorServiceImpl {
-//! #     fn add(&self, left: u32, right: u32) -> u32 { left + right }
-//! # }
-//! # async fn example() {
-//! // create a MessageChannel
+//! # pub trait Calculator { fn add(&self, l: u32, r: u32) -> u32; }
+//! # struct Calc;
+//! # impl Calculator for Calc { fn add(&self, l: u32, r: u32) -> u32 { l + r } }
+//! # async fn run() {
 //! let channel = web_sys::MessageChannel::new().unwrap();
-//! // Create two interfaces from the ports
-//! let (server_interface, client_interface) = futures_util::future::join(
+//! let (server_iface, client_iface) = futures_util::future::join(
 //!     web_rpc::Interface::new(channel.port1()),
 //!     web_rpc::Interface::new(channel.port2()),
 //! ).await;
-//! // create a server with the first interface
-//! let server = web_rpc::Builder::new(server_interface)
-//!     .with_service::<CalculatorService<_>>(CalculatorServiceImpl)
+//!
+//! let server = web_rpc::Builder::new(server_iface)
+//!     .with_service::<CalculatorService<_>>(Calc)
 //!     .build();
-//! // spawn the server
 //! wasm_bindgen_futures::spawn_local(server);
-//! # }
-//! ```
-//! [`Interface::new`] is async since there is no way to synchronously check whether a channel or
-//! a worker is ready to receive messages. To workaround this, temporary listeners are attached to
-//! determine when a channel is ready for communication. The server returned by the build method is
-//! a future that can be added to the browser's event loop using
-//! [`wasm_bindgen_futures::spawn_local`], however, this will run the server indefinitely. For more
-//! control, consider wrapping the server with [`futures_util::FutureExt::remote_handle`] before
-//! spawning it, which will shutdown the server once the handle has been dropped. Moving onto the
-//! client:
-//! ```rust,no_run
-//! # #[web_rpc::service]
-//! # pub trait Calculator {
-//! #     fn add(&self, left: u32, right: u32) -> u32;
-//! # }
-//! # async fn example(client_interface: web_rpc::Interface) {
-//! // create a client using the second interface
-//! let client = web_rpc::Builder::new(client_interface)
+//!
+//! let client = web_rpc::Builder::new(client_iface)
 //!     .with_client::<CalculatorClient>()
 //!     .build();
-//! /* call `add` */
 //! assert_eq!(client.add(41, 1).await, 42);
 //! # }
 //! ```
-//! That is it! Underneath the hood, the client will serialize its arguments using bincode and
-//! transfer the bytes to server. The server will deserialize those arguments and run
-//! `<CalculatorServiceImpl as Calculator>::add` before returning the result to the client. Note
-//! that we are only awaiting the response of the call to `add`, the request itself is sent
-//! synchronously before we await anything.
 //!
-//! ## Advanced examples
-//! Now that we have the basic idea of how define an RPC trait and set up a server and client, let's
-//! dive into some of the more advanced features of this library!
-//!
-//! ### Synchronous and asynchronous RPC methods
-//! Server methods can be asynchronous! That is, you can define the following RPC trait and service
-//! implementation:
-//! ```rust,no_run
-//! # use std::time::Duration;
-//! #[web_rpc::service]
-//! pub trait Sleep {
-//!     async fn sleep(&self, interval: Duration);
-//! }
-//!
-//! struct SleepServiceImpl;
-//! impl Sleep for SleepServiceImpl {
-//!     async fn sleep(&self, interval: Duration) {
-//!         gloo_timers::future::sleep(interval).await;
-//!     }
-//! }
-//! ```
-//! Asynchronous RPC methods are run concurrently on the server and also support cancellation if the
-//! future on the client side is dropped. However, such a future is only returned from a client
-//! method if the RPC returns a value. Otherwise the RPC is considered a notification.
-//!
-//! ### Notifications
-//! Notifications are RPCs that do not return anything. On the client side, the method is completely
-//! synchronous and also returns nothing. This setup is useful if you need to communicate with
-//! another part of your application but cannot yield to the event loop.
-//!
-//! The implication of this, however, is that even if the server method is asynchronous, we are
-//! unable to cancel it from the client side since we do not have a future that can be dropped.
-//!
-//! ### Posting and transferring Javascript types
-//! In the example above, we discussed how the client serializes its arguments before sending them
-//! to the server. This approach is convenient, but how do send web types such as a
-//! `WebAssembly.Module` or an `OffscreenCanvas` that have no serializable representation? Well, we
-//! are in luck since this happens to be one of the key features of this crate. Consider the
-//! following RPC trait:
+//! # Routing
 //! ```rust
 //! #[web_rpc::service]
-//! pub trait Concat {
-//!     #[post(left, right, return)]
-//!     fn concat_with_space(
-//!         &self,
-//!         left: js_sys::JsString,
-//!         right: js_sys::JsString
-//!     ) -> js_sys::JsString;
+//! pub trait Routing {
+//!     // Plain types that implement Serialize go through bincode.
+//!     fn add(&self, l: u32, r: u32) -> u32;
+//!     // Anything `AsRef<JsValue>` is posted through the JS array.
+//!     fn echo(&self, s: js_sys::JsString) -> js_sys::JsString;
+//!     // `Option`/`Result` recurse: Ok(Some(_)) is posted, Ok(None) is one byte,
+//!     // Err carries a bincoded `String`.
+//!     fn lookup(&self, k: u32) -> Result<Option<js_sys::JsString>, String>;
+//!     // `&str` / `&[u8]` deserialize zero-copy on the server.
+//!     fn count(&self, data: &[u8]) -> usize;
+//!     // References to JS types are accepted too and are decoded via JsCast::dyn_ref.
+//!     fn len(&self, s: &js_sys::JsString) -> u32;
 //! }
 //! ```
-//! All we have done is added the `post` attribute to the method and listed the arguments that we
-//! would like to be posted to the other side. Under the hood, the implementation of the client will
-//! then skip these arguments during serialization and just append them after the serialized message
-//! to the array that will be posted. As shown above, this also works for the return type by just
-//! specifying `return` in the post attribute. For web types that need to be transferred, we simply
-//! wrap them in `transfer` as follows:
+//!
+//! # Async, notifications, streaming
 //! ```rust
+//! use futures_core::Stream;
+//!
 //! #[web_rpc::service]
-//! pub trait GameEngine {
-//!     #[post(transfer(canvas))]
-//!     fn send_canvas(
+//! pub trait Misc {
+//!     // `async` here makes the server impl async; the client side is also async because we return a u32.
+//!     async fn slow(&self, ms: u32) -> u32;
+//!     // No return type means the method is a notification.
+//!     fn fire(&self, msg: String);
+//!     // `impl Stream<Item = T>` makes the method a streaming RPC.
+//!     fn items(&self, n: u32) -> impl Stream<Item = u32>;
+//! }
+//! ```
+//! On the client side, RPC methods that have a return type are async and yield a
+//! [`client::RequestFuture<T>`] which you await for the response. Methods without a return type
+//! are sync and act as fire-and-forget notifications. This is independent of whether the trait
+//! method itself is marked `async`, which only affects the server implementation. Dropping the
+//! `RequestFuture` cancels the request, so notifications cannot be cancelled.
+//!
+//! Streaming methods return a [`client::StreamReceiver<T>`] that yields each item the server
+//! produces. Dropping the receiver aborts the stream on the server, while
+//! [`close`](client::StreamReceiver::close) lets buffered items finish arriving instead.
+//! Streaming methods can also be `async` and the items they yield can be wrapper types like
+//! `Result<JsT, E>`.
+//!
+//! # Transfer
+//! Anything that should be transferred to the other side rather than copied with the structured
+//! clone algorithm can be specified inside a `#[transfer(...)]` attribute as a comma-separated
+//! list. The simplest case is to list the parameter that holds the transferable value, but if
+//! that value is wrapped or derived from a parameter, you can use a parameter-name expression
+//! (`name => expr`, evaluated with `name` in scope), a closure with a refutable pattern
+//! (`name => |pat| body`), or a match-block (`name => match { arm, ... }`). The same forms also
+//! work for the return value via `return`.
+//! ```rust
+//! # use wasm_bindgen::JsCast;
+//! #[web_rpc::service]
+//! pub trait Transfer {
+//!     // Bare param + derived expression + return closure.
+//!     #[transfer(
+//!         canvas,
+//!         data => data.buffer(),
+//!         return => |Ok(buf)| buf.buffer(),
+//!     )]
+//!     fn render(
 //!         &self,
 //!         canvas: web_sys::OffscreenCanvas,
-//!     );
+//!         data: js_sys::Uint8Array,
+//!     ) -> Result<js_sys::Uint8Array, String>;
+//!
+//!     // Match-block: useful when several variants need transferring.
+//!     #[transfer(return => match { Some(buf) => buf.buffer(), })]
+//!     fn maybe(&self) -> Option<js_sys::Uint8Array>;
 //! }
 //! ```
-//! ### Optional and fallible JavaScript types
-//! Posted JavaScript types can be wrapped in `Option` or `Result` to handle cases where
-//! a value may be absent or an operation may fail. This works for both arguments and
-//! return types, including streaming methods. When the value is `Some` or `Ok`, the
-//! JavaScript object is posted as usual. When the value is `None` or `Err`, no JavaScript
-//! object is sent — only a serialized discriminant travels over the wire.
 //!
-//! For example, a method that optionally returns a JavaScript string:
-//! ```rust
-//! #[web_rpc::service]
-//! pub trait Lookup {
-//!     #[post(return)]
-//!     fn find(&self, key: u32) -> Option<js_sys::JsString>;
-//! }
-//!
-//! struct LookupImpl;
-//! impl Lookup for LookupImpl {
-//!     fn find(&self, key: u32) -> Option<js_sys::JsString> {
-//!         if key == 42 {
-//!             Some(js_sys::JsString::from("found it"))
-//!         } else {
-//!             None
-//!         }
-//!     }
-//! }
-//! ```
-//! The client receives `RequestFuture<Option<js_sys::JsString>>` and can check
-//! whether the server returned a value.
-//!
-//! Similarly, a method that returns a `Result` where both the `Ok` and `Err` types
-//! are JavaScript objects can use `#[post(return)]` — both variants are posted:
-//! ```rust
-//! #[web_rpc::service]
-//! pub trait Parser {
-//!     #[post(return)]
-//!     fn parse(&self, input: String) -> Result<js_sys::JsString, js_sys::Error>;
-//! }
-//!
-//! struct ParserImpl;
-//! impl Parser for ParserImpl {
-//!     fn parse(&self, input: String) -> Result<js_sys::JsString, js_sys::Error> {
-//!         if input.is_empty() {
-//!             Err(js_sys::Error::new("empty input"))
-//!         } else {
-//!             Ok(js_sys::JsString::from(input.as_str()))
-//!         }
-//!     }
-//! }
-//! ```
-//! Arguments can also be optional JavaScript types:
-//! ```rust
-//! #[web_rpc::service]
-//! pub trait Formatter {
-//!     #[post(label)]
-//!     fn format(&self, label: Option<js_sys::JsString>) -> String;
-//! }
-//! ```
-//! All of these wrappers combine with streaming methods too — for example,
-//! `impl Stream<Item = Result<js_sys::JsString, String>>` with `#[post(return)]`
-//! will stream `Result` values where the `Ok` variant carries a posted JavaScript
-//! object and the `Err` variant carries a serialized error.
-//!
-//! ### Borrowed parameters
-//! RPC methods can accept borrowed types such as `&str` and `&[u8]`, which are deserialized
-//! zero-copy on the server side:
-//! ```rust
-//! #[web_rpc::service]
-//! pub trait Greeter {
-//!     fn greet(&self, name: &str, greeting: &str) -> String;
-//!     fn count_bytes(&self, data: &[u8]) -> usize;
-//! }
-//!
-//! struct GreeterServiceImpl;
-//! impl Greeter for GreeterServiceImpl {
-//!     fn greet(&self, name: &str, greeting: &str) -> String {
-//!         format!("{greeting}, {name}!")
-//!     }
-//!     fn count_bytes(&self, data: &[u8]) -> usize {
-//!         data.len()
-//!     }
-//! }
-//! ```
-//! This avoids unnecessary allocations — the server deserializes directly from the received
-//! message bytes without copying into owned `String` or `Vec<u8>` types. On the client side,
-//! borrowed parameters are serialized inline before the method returns, so standard Rust
-//! lifetime rules apply. Note that only types with serde borrowing support (`&str`, `&[u8]`)
-//! benefit from zero-copy deserialization.
-//!
-//! ### Streaming
-//! Methods can return a stream of items using `impl Stream<Item = T>` as the return type.
-//! The macro detects this and generates the appropriate client and server code. On the client
-//! side, the method returns a [`client::StreamReceiver<T>`] which implements
-//! [`futures_core::Stream`]. On the server side, the return type is preserved as-is:
-//! ```rust
-//! #[web_rpc::service]
-//! pub trait DataSource {
-//!     fn stream_data(&self, count: u32) -> impl futures_core::Stream<Item = u32>;
-//! }
-//!
-//! struct DataSourceImpl;
-//! impl DataSource for DataSourceImpl {
-//!     fn stream_data(&self, count: u32) -> impl futures_core::Stream<Item = u32> {
-//!         let (tx, rx) = futures_channel::mpsc::unbounded();
-//!         for i in 0..count {
-//!             let _ = tx.unbounded_send(i);
-//!         }
-//!         rx
-//!     }
-//! }
-//! ```
-//! Dropping the [`client::StreamReceiver`] sends an abort signal to the server, cancelling the
-//! stream. Alternatively, calling [`close`](client::StreamReceiver::close) stops the server
-//! while still allowing buffered items to be drained. Streaming methods can also be async and
-//! can be combined with the `#[post(return)]` attribute for streaming JavaScript types.
-//!
-//! ### Bi-directional RPC
-//! In the original example, we created a server on the first port of the message channel and a
-//! client on the second port. However, it is possible to define both a client and a server on each
-//! side, enabling bi-directional RPC. This is particularly useful if we want to send and receive
-//! messages from a worker without sending it a seperate channel for the bi-directional
-//! communication. Our original example can be extended as follows:
+//! # Bi-directional
+//! Both sides of a channel can be set up to act as both client and server at the same time. To
+//! do this, stack [`with_service`](Builder::with_service) and
+//! [`with_client`](Builder::with_client) on the same [`Builder`] before calling `build()`, which
+//! then returns a `(C, Server)` tuple instead of one or the other.
 //! ```rust,no_run
 //! # #[web_rpc::service]
-//! # pub trait Calculator {
-//! #     fn add(&self, left: u32, right: u32) -> u32;
-//! # }
-//! # struct CalculatorServiceImpl;
-//! # impl Calculator for CalculatorServiceImpl {
-//! #     fn add(&self, left: u32, right: u32) -> u32 { left + right }
-//! # }
-//! # async fn example() {
-//! /* create channel */
-//! let channel = web_sys::MessageChannel::new().unwrap();
-//! let (interface1, interface2) = futures_util::future::join(
-//!     web_rpc::Interface::new(channel.port1()),
-//!     web_rpc::Interface::new(channel.port2()),
-//! ).await;
-//! /* create server1 and client1 */
-//! let (client1, server1) = web_rpc::Builder::new(interface1)
-//!     .with_service::<CalculatorService<_>>(CalculatorServiceImpl)
-//!     .with_client::<CalculatorClient>()
-//!     .build();
-//! /* create server2 and client2 */
-//! let (client2, server2) = web_rpc::Builder::new(interface2)
-//!     .with_service::<CalculatorService<_>>(CalculatorServiceImpl)
+//! # pub trait Calculator { fn add(&self, l: u32, r: u32) -> u32; }
+//! # struct Calc;
+//! # impl Calculator for Calc { fn add(&self, l: u32, r: u32) -> u32 { l + r } }
+//! # async fn run() {
+//! # let channel = web_sys::MessageChannel::new().unwrap();
+//! # let (iface, _) = futures_util::future::join(
+//! #     web_rpc::Interface::new(channel.port1()),
+//! #     web_rpc::Interface::new(channel.port2()),
+//! # ).await;
+//! let (client, server) = web_rpc::Builder::new(iface)
+//!     .with_service::<CalculatorService<_>>(Calc)
 //!     .with_client::<CalculatorClient>()
 //!     .build();
 //! # }
@@ -343,6 +184,8 @@ pub use wasm_bindgen;
 pub use web_rpc_macro::service;
 
 pub mod client;
+#[doc(hidden)]
+pub mod codec;
 pub mod interface;
 pub mod port;
 #[doc(hidden)]

@@ -12,8 +12,7 @@ use syn::{
     punctuated::Punctuated,
     spanned::Spanned,
     token::Comma,
-    Attribute, FnArg, Ident, Lifetime, Meta, NestedMeta, Pat, PatType, ReturnType, Token, Type,
-    Visibility,
+    Attribute, FnArg, Ident, Lifetime, Pat, PatType, ReturnType, Token, Type, Visibility,
 };
 
 macro_rules! extend_errors {
@@ -84,23 +83,121 @@ fn result_inner_types(ty: &Type) -> Option<(&Type, &Type)> {
     None
 }
 
-/// Describes how a posted type is wrapped.
-enum PostWrapperKind<'a> {
-    /// Bare JS type, e.g., `JsString`
-    Bare,
-    /// `Option<JsType>`
-    Option { inner_ty: &'a Type },
-    /// `Result<JsType, E>`
-    Result { ok_ty: &'a Type, err_ty: &'a Type },
+/// True if `ty` is `&str` or `&[u8]` — the only reference shapes we route through
+/// the existing serde-borrowing path (zero-copy, with an `'a` lifetime injected
+/// into the request enum). Any other reference shape goes through the JS path.
+fn is_borrowed_serde_ref(ty: &Type) -> bool {
+    if let Type::Reference(r) = ty {
+        match &*r.elem {
+            Type::Path(p) if p.path.is_ident("str") => return true,
+            Type::Slice(s) => {
+                if let Type::Path(p) = &*s.elem {
+                    if p.path.is_ident("u8") {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
-fn post_wrapper_kind(ty: &Type) -> PostWrapperKind<'_> {
+/// True if `ty` is a reference to a presumed JS type (anything other than
+/// `&str`/`&[u8]`). The receiver side decodes these via `JsCast::dyn_ref`.
+fn is_js_ref(ty: &Type) -> bool {
+    matches!(ty, Type::Reference(_)) && !is_borrowed_serde_ref(ty)
+}
+
+/// Recursively emit code that encodes a value of type `ty` into a `WireArg`,
+/// pushing JS values onto `post` as a side-effect.
+///
+/// Caller supplies `value` as a token-tree expression (typically an ident binding).
+/// The emitted code matches structure on `Option`/`Result` and recurses; bare
+/// leaves dispatch through the autoref encoder traits.
+///
+/// Reference-to-JS types should be handled by the caller before invoking this
+/// helper — they cannot be encoded as nested elements (no `Decoder<&T>` impl on
+/// the receiver side).
+fn emit_encode(ty: &Type, value: TokenStream2, post: &TokenStream2) -> TokenStream2 {
+    // Match against `&#value` so the original binding remains accessible to any
+    // transfer-side code emitted alongside the encoder. Match ergonomics binds
+    // `__inner` as a reference inside each arm.
     if let Some(inner) = option_inner_type(ty) {
-        PostWrapperKind::Option { inner_ty: inner }
-    } else if let Some((ok_ty, err_ty)) = result_inner_types(ty) {
-        PostWrapperKind::Result { ok_ty, err_ty }
+        let inner_enc = emit_encode(inner, quote!(__inner), post);
+        quote_spanned! {ty.span()=>
+            match &#value {
+                ::core::option::Option::Some(__inner) =>
+                    web_rpc::codec::WireArg::Some(std::boxed::Box::new(#inner_enc)),
+                ::core::option::Option::None =>
+                    web_rpc::codec::WireArg::None,
+            }
+        }
+    } else if let Some((ok, err)) = result_inner_types(ty) {
+        let ok_enc = emit_encode(ok, quote!(__inner), post);
+        let err_enc = emit_encode(err, quote!(__inner), post);
+        quote_spanned! {ty.span()=>
+            match &#value {
+                ::core::result::Result::Ok(__inner) =>
+                    web_rpc::codec::WireArg::Ok(std::boxed::Box::new(#ok_enc)),
+                ::core::result::Result::Err(__inner) =>
+                    web_rpc::codec::WireArg::Err(std::boxed::Box::new(#err_enc)),
+            }
+        }
     } else {
-        PostWrapperKind::Bare
+        quote_spanned! {ty.span()=>
+            {
+                #[allow(unused_imports)]
+                use web_rpc::codec::{
+                    __RpcJsEncode as _,
+                    __RpcSerialEncode as _,
+                };
+                (&#value).__rpc_encode(#post)
+            }
+        }
+    }
+}
+
+/// Recursively emit code that decodes a `WireArg` of type `ty` into a Rust value,
+/// shifting JS values off `post` as needed.
+///
+/// Caller supplies `wire` as a token-tree expression evaluating to a `WireArg`.
+/// Reference-to-JS types should be handled by the caller — see `emit_encode`.
+fn emit_decode(ty: &Type, wire: TokenStream2, post: &TokenStream2) -> TokenStream2 {
+    if let Some(inner) = option_inner_type(ty) {
+        let inner_dec = emit_decode(inner, quote!(*__inner), post);
+        quote_spanned! {ty.span()=>
+            match #wire {
+                web_rpc::codec::WireArg::Some(__inner) =>
+                    ::core::option::Option::Some(#inner_dec),
+                web_rpc::codec::WireArg::None =>
+                    ::core::option::Option::None,
+                _ => panic!("web_rpc: wire/type mismatch — expected Some or None"),
+            }
+        }
+    } else if let Some((ok, err)) = result_inner_types(ty) {
+        let ok_dec = emit_decode(ok, quote!(*__inner), post);
+        let err_dec = emit_decode(err, quote!(*__inner), post);
+        quote_spanned! {ty.span()=>
+            match #wire {
+                web_rpc::codec::WireArg::Ok(__inner) =>
+                    ::core::result::Result::Ok(#ok_dec),
+                web_rpc::codec::WireArg::Err(__inner) =>
+                    ::core::result::Result::Err(#err_dec),
+                _ => panic!("web_rpc: wire/type mismatch — expected Ok or Err"),
+            }
+        }
+    } else {
+        quote_spanned! {ty.span()=>
+            {
+                #[allow(unused_imports)]
+                use web_rpc::codec::{
+                    __RpcJsDecode as _,
+                    __RpcSerialDecode as _,
+                };
+                (&web_rpc::codec::Decoder::<#ty>::default()).__rpc_decode(#wire, #post)
+            }
+        }
     }
 }
 
@@ -117,9 +214,31 @@ struct RpcMethod {
     receiver: syn::Receiver,
     ident: Ident,
     args: Vec<PatType>,
-    transfer: HashSet<Ident>,
-    post: HashSet<Ident>,
+    transfer: Vec<TransferClause>,
     output: ReturnType,
+}
+
+/// One entry inside a `#[transfer(...)]` attribute.
+#[allow(dead_code)]
+enum TransferClause {
+    /// `name` — push the parameter itself, unconditionally.
+    BareParam(Ident),
+    /// `data => data.buffer()` — push the expression's result, unconditionally.
+    ParamExpr { name: Ident, body: syn::Expr },
+    /// `data => |Some(d)| d.buffer()` (closure) or
+    /// `data => match { Some(d) => d.buffer(), ... }` (match-block).
+    /// Each `Gate` becomes one `if let pat = &name { __transfer.push(body) }`.
+    ParamGated { name: Ident, gates: Vec<Gate> },
+    /// `return` — push the response value itself, unconditionally.
+    BareReturn,
+    /// `return => |Ok(o)| o.buffer()` or `return => match { ... }`.
+    ReturnGated { gates: Vec<Gate> },
+}
+
+#[allow(dead_code)]
+struct Gate {
+    pat: syn::Pat,
+    body: syn::Expr,
 }
 
 struct ServiceGenerator<'a> {
@@ -152,33 +271,24 @@ impl<'a> ServiceGenerator<'a> {
             quote!()
         };
         let variants = rpcs.iter().zip(camel_case_idents.iter()).map(
-            |(RpcMethod { args, post, .. }, camel_case_ident)| {
-                let fields = args.iter().filter_map(|arg| {
-                    let is_post =
-                        matches!(&*arg.pat, Pat::Ident(ident) if post.contains(&ident.ident));
-                    if is_post {
-                        // For wrapped post args, include a discriminant field
-                        let pat = &arg.pat;
-                        match post_wrapper_kind(&arg.ty) {
-                            PostWrapperKind::Option { .. } => Some(quote! { #pat: bool }),
-                            PostWrapperKind::Result { .. } => Some(quote! { #pat: bool }),
-                            PostWrapperKind::Bare => None, // bare post args excluded
-                        }
+            |(RpcMethod { args, .. }, camel_case_ident)| {
+                let fields = args.iter().map(|arg| {
+                    let pat = &arg.pat;
+                    if is_borrowed_serde_ref(&arg.ty) {
+                        // `&str` / `&[u8]` — keep zero-copy serde borrowing path.
+                        let mut type_ref = match &*arg.ty {
+                            Type::Reference(r) => r.clone(),
+                            _ => unreachable!("is_borrowed_serde_ref guarantees a reference"),
+                        };
+                        type_ref.lifetime =
+                            Some(Lifetime::new("'a", type_ref.and_token.span()));
+                        quote_spanned! {arg.ty.span()=> #pat: #type_ref }
                     } else {
-                        // Non-post args included as-is (with lifetime fix for borrowed)
-                        Some(if has_borrowed_args {
-                            if let Type::Reference(type_ref) = &*arg.ty {
-                                let mut type_ref = type_ref.clone();
-                                type_ref.lifetime =
-                                    Some(Lifetime::new("'a", type_ref.and_token.span()));
-                                let pat = &arg.pat;
-                                quote! { #pat: #type_ref }
-                            } else {
-                                quote! { #arg }
-                            }
-                        } else {
-                            quote! { #arg }
-                        })
+                        // Everything else (including `&JsT`) uses the universal
+                        // recursive WireArg representation.
+                        quote_spanned! {arg.ty.span()=>
+                            #pat: web_rpc::codec::WireArg
+                        }
                     }
                 });
                 quote! {
@@ -203,37 +313,14 @@ impl<'a> ServiceGenerator<'a> {
             ..
         } = self;
         let variants = rpcs.iter().zip(camel_case_idents.iter()).map(
-            |(RpcMethod { output, post, .. }, camel_case_ident)| match output {
-                ReturnType::Type(_, ty) if !post.contains(&Ident::new("return", output.span())) => {
-                    // For streaming methods, use the inner item type
-                    if let Some(item_ty) = stream_item_type(ty) {
-                        quote! {
-                            #camel_case_ident ( #item_ty )
-                        }
-                    } else {
-                        quote! {
-                            #camel_case_ident ( #ty )
-                        }
-                    }
+            |(_method, camel_case_ident)| {
+                // Every method's response variant carries a single uniform
+                // `WireArg`. Notification methods (no return) still get a
+                // variant — the macro fills it with a placeholder that the
+                // client never reads.
+                quote! {
+                    #camel_case_ident ( web_rpc::codec::WireArg )
                 }
-                ReturnType::Type(_, ty) => {
-                    // post(return) — determine the effective type (stream item or raw return)
-                    let effective_ty = stream_item_type(ty).unwrap_or(ty);
-                    match post_wrapper_kind(effective_ty) {
-                        PostWrapperKind::Bare => quote! {
-                            #camel_case_ident ( () )
-                        },
-                        PostWrapperKind::Option { .. } => quote! {
-                            #camel_case_ident ( bool )
-                        },
-                        PostWrapperKind::Result { .. } => quote! {
-                            #camel_case_ident ( bool )
-                        },
-                    }
-                }
-                _ => quote! {
-                    #camel_case_ident ( () )
-                },
             },
         );
         quote! {
@@ -360,209 +447,94 @@ impl<'a> ServiceGenerator<'a> {
         let rpc_fns = rpcs
             .iter()
             .zip(camel_case_idents.iter())
-            .map(|(RpcMethod { attrs, args, transfer, post, ident, output, .. }, camel_case_ident)| {
-                // Build request struct fields — non-post args use ident directly,
-                // wrapped post args use a discriminant value
-                let request_struct_fields: Vec<_> = args.iter()
-                    .filter_map(|arg| match &*arg.pat {
-                        Pat::Ident(pat_ident) => {
-                            let id = &pat_ident.ident;
-                            if post.contains(id) {
-                                match post_wrapper_kind(&arg.ty) {
-                                    PostWrapperKind::Bare => None,
-                                    PostWrapperKind::Option { .. } => {
-                                        Some(quote! { #id: #id.is_some() })
-                                    }
-                                    PostWrapperKind::Result { .. } => {
-                                        Some(quote! { #id: #id.is_ok() })
-                                    }
-                                }
-                            } else {
-                                Some(quote! { #id })
-                            }
-                        }
-                        _ => None
-                    })
-                    .collect();
+            .map(|(RpcMethod { attrs, args, transfer, ident, output, .. }, camel_case_ident)| {
+                // 1. Per-arg encoding: borrowed `&str`/`&[u8]` pass through inline;
+                // everything else routes through the autoref-dispatched `__rpc_encode`.
+                let mut arg_encodings = Vec::<TokenStream2>::new();
+                let mut request_struct_fields = Vec::<TokenStream2>::new();
+                for arg in args {
+                    let id = match &*arg.pat {
+                        Pat::Ident(p) => &p.ident,
+                        _ => continue,
+                    };
+                    if is_borrowed_serde_ref(&arg.ty) {
+                        request_struct_fields.push(quote! { #id });
+                    } else {
+                        let wire_ident = format_ident!("__wire_{}", id);
+                        let post = quote!(&__post);
+                        let enc = emit_encode(&arg.ty, quote!(#id), &post);
+                        arg_encodings.push(quote! { let #wire_ident = #enc; });
+                        request_struct_fields.push(quote! { #id: #wire_ident });
+                    }
+                }
 
-                // Build JS post/transfer array pushes — bare post args always push,
-                // wrapped post args conditionally push
-                let post_pushes: Vec<_> = args.iter()
-                    .filter_map(|arg| match &*arg.pat {
-                        Pat::Ident(pat_ident) if post.contains(&pat_ident.ident) => {
-                            let id = &pat_ident.ident;
-                            let is_transfer = transfer.contains(&pat_ident.ident);
-                            match post_wrapper_kind(&arg.ty) {
-                                PostWrapperKind::Bare => {
-                                    let transfer_push = if is_transfer {
-                                        quote! { __transfer.push(#id.as_ref()); }
-                                    } else {
-                                        quote! {}
-                                    };
-                                    Some(quote! {
-                                        __post.push(#id.as_ref());
-                                        #transfer_push
-                                    })
-                                }
-                                PostWrapperKind::Option { .. } => {
-                                    let transfer_push = if is_transfer {
-                                        quote! { __transfer.push(__val.as_ref()); }
-                                    } else {
-                                        quote! {}
-                                    };
-                                    Some(quote! {
-                                        if let Some(ref __val) = #id {
-                                            __post.push(__val.as_ref());
-                                            #transfer_push
-                                        }
-                                    })
-                                }
-                                PostWrapperKind::Result { .. } => {
-                                    let transfer_push = if is_transfer {
-                                        quote! { __transfer.push(__val.as_ref()); }
-                                    } else {
-                                        quote! {}
-                                    };
-                                    Some(quote! {
-                                        match #id {
-                                            Ok(ref __val) => {
-                                                __post.push(__val.as_ref());
-                                                #transfer_push
-                                            }
-                                            Err(ref __val) => {
-                                                __post.push(__val.as_ref());
-                                                #transfer_push
-                                            }
-                                        }
-                                    })
-                                }
-                            }
-                        }
-                        _ => None
-                    })
-                    .collect();
-
-                // Static transfer args (bare post args that are also transfer)
-                let bare_transfer_arg_idents: Vec<_> = args.iter()
-                    .filter_map(|arg| match &*arg.pat {
-                        Pat::Ident(pat_ident) if transfer.contains(&pat_ident.ident)
-                            && matches!(post_wrapper_kind(&arg.ty), PostWrapperKind::Bare) =>
+                // 2. Per-method transfer pushes (param-side only; return-side
+                // clauses are handled in struct_server).
+                let transfer_pushes = transfer.iter().filter_map(|c| match c {
+                    TransferClause::BareParam(name) => Some(quote! {
+                        __transfer.push(#name.as_ref());
+                    }),
+                    TransferClause::ParamExpr { name, body } => Some(quote_spanned! {body.span()=>
                         {
-                            Some(&pat_ident.ident)
+                            let _ = &#name; // ensure name is referenced
+                            __transfer.push((#body).as_ref());
                         }
-                        _ => None
-                    })
-                    .collect();
-
-                let has_wrapped_post_args = args.iter().any(|arg| {
-                    matches!(&*arg.pat, Pat::Ident(pat_ident)
-                        if post.contains(&pat_ident.ident)
-                        && !matches!(post_wrapper_kind(&arg.ty), PostWrapperKind::Bare))
+                    }),
+                    TransferClause::ParamGated { name, gates } => {
+                        let arms = gates.iter().map(|g| {
+                            let pat = &g.pat;
+                            let body = &g.body;
+                            quote_spanned! {body.span()=>
+                                if let #pat = &#name {
+                                    __transfer.push((#body).as_ref());
+                                }
+                            }
+                        });
+                        Some(quote! { #( #arms )* })
+                    }
+                    TransferClause::BareReturn | TransferClause::ReturnGated { .. } => None,
                 });
 
-                // Generate the send_request code
-                let send_request = if has_wrapped_post_args {
-                    // Use incremental push for post/transfer arrays
-                    quote! {
-                        let __seq_id = self.seq_id.replace_with(|seq_id| seq_id.wrapping_add(1));
-                        let __request = #request_ident::#camel_case_ident {
-                            #( #request_struct_fields ),*
-                        };
-                        let __header = web_rpc::MessageHeader::Request(__seq_id);
-                        let __header_bytes = web_rpc::bincode::serialize(&__header).unwrap();
-                        let __header_buffer = web_rpc::js_sys::Uint8Array::from(&__header_bytes[..]).buffer();
-                        let __payload_bytes = web_rpc::bincode::serialize(&__request).unwrap();
-                        let __payload_buffer = web_rpc::js_sys::Uint8Array::from(&__payload_bytes[..]).buffer();
-                        let __post = web_rpc::js_sys::Array::new();
-                        let __transfer = web_rpc::js_sys::Array::new();
-                        __post.push(__header_buffer.as_ref());
-                        __post.push(__payload_buffer.as_ref());
-                        __transfer.push(__header_buffer.as_ref());
-                        __transfer.push(__payload_buffer.as_ref());
-                        #( #post_pushes )*
-                        self.port.post_message(&__post, &__transfer).unwrap();
-                    }
-                } else {
-                    // Original slice-literal approach for bare post args
-                    let bare_post_arg_idents: Vec<_> = args.iter()
-                        .filter_map(|arg| match &*arg.pat {
-                            Pat::Ident(pat_ident) if post.contains(&pat_ident.ident) => Some(&pat_ident.ident),
-                            _ => None
-                        })
-                        .collect();
-                    quote! {
-                        let __seq_id = self.seq_id.replace_with(|seq_id| seq_id.wrapping_add(1));
-                        let __request = #request_ident::#camel_case_ident {
-                            #( #request_struct_fields ),*
-                        };
-                        let __header = web_rpc::MessageHeader::Request(__seq_id);
-                        let __header_bytes = web_rpc::bincode::serialize(&__header).unwrap();
-                        let __header_buffer = web_rpc::js_sys::Uint8Array::from(&__header_bytes[..]).buffer();
-                        let __payload_bytes = web_rpc::bincode::serialize(&__request).unwrap();
-                        let __payload_buffer = web_rpc::js_sys::Uint8Array::from(&__payload_bytes[..]).buffer();
-                        let __post: &[&web_rpc::wasm_bindgen::JsValue] =
-                            &[__header_buffer.as_ref(), __payload_buffer.as_ref(), #( #bare_post_arg_idents.as_ref() ),*];
-                        let __post = web_rpc::js_sys::Array::from_iter(__post);
-                        let __transfer: &[&web_rpc::wasm_bindgen::JsValue] =
-                            &[__header_buffer.as_ref(), __payload_buffer.as_ref(), #( #bare_transfer_arg_idents.as_ref() ),*];
-                        let __transfer = web_rpc::js_sys::Array::from_iter(__transfer);
-                        self.port.post_message(&__post, &__transfer).unwrap();
-                    }
+                let send_request = quote! {
+                    let __seq_id = self.seq_id.replace_with(|seq_id| seq_id.wrapping_add(1));
+                    let __post = web_rpc::js_sys::Array::new();
+                    let __transfer = web_rpc::js_sys::Array::new();
+                    #( #arg_encodings )*
+                    let __request = #request_ident::#camel_case_ident {
+                        #( #request_struct_fields ),*
+                    };
+                    let __header = web_rpc::MessageHeader::Request(__seq_id);
+                    let __header_bytes = web_rpc::bincode::serialize(&__header).unwrap();
+                    let __header_buffer = web_rpc::js_sys::Uint8Array::from(&__header_bytes[..]).buffer();
+                    let __payload_bytes = web_rpc::bincode::serialize(&__request).unwrap();
+                    let __payload_buffer = web_rpc::js_sys::Uint8Array::from(&__payload_bytes[..]).buffer();
+                    // Prepend [header, payload] in front of the encoded JS values.
+                    __post.unshift(&__payload_buffer);
+                    __post.unshift(&__header_buffer);
+                    __transfer.push(__header_buffer.as_ref());
+                    __transfer.push(__payload_buffer.as_ref());
+                    #( #transfer_pushes )*
+                    self.port.post_message(&__post, &__transfer).unwrap();
                 };
 
-                // Check if this is a streaming method
-                let is_streaming = matches!(output, ReturnType::Type(_, ref ty) if stream_item_type(ty).is_some());
+                let is_streaming = matches!(
+                    output,
+                    ReturnType::Type(_, ref ty) if stream_item_type(ty).is_some()
+                );
 
                 if is_streaming {
                     let item_ty = match output {
                         ReturnType::Type(_, ref ty) => stream_item_type(ty).unwrap(),
                         _ => unreachable!(),
                     };
+                    let dec = emit_decode(item_ty, quote!(__wire), &quote!(&__post_array));
 
-                    let unpack_stream_item = if post.contains(&Ident::new("return", output.span())) {
-                        match post_wrapper_kind(item_ty) {
-                            PostWrapperKind::Bare => quote! {
-                                |(_response, __post_array)| {
-                                    web_rpc::wasm_bindgen::JsCast::dyn_into::<#item_ty>(__post_array.shift())
-                                        .unwrap()
-                                }
-                            },
-                            PostWrapperKind::Option { inner_ty } => quote! {
-                                |(__response, __post_array)| {
-                                    let #response_ident::#camel_case_ident(__has_value) = __response else {
-                                        panic!("received incorrect response variant")
-                                    };
-                                    if __has_value {
-                                        Some(web_rpc::wasm_bindgen::JsCast::dyn_into::<#inner_ty>(__post_array.shift())
-                                            .unwrap())
-                                    } else {
-                                        None
-                                    }
-                                }
-                            },
-                            PostWrapperKind::Result { ok_ty, err_ty } => quote! {
-                                |(__response, __post_array)| {
-                                    let #response_ident::#camel_case_ident(__is_ok) = __response else {
-                                        panic!("received incorrect response variant")
-                                    };
-                                    if __is_ok {
-                                        Ok(web_rpc::wasm_bindgen::JsCast::dyn_into::<#ok_ty>(__post_array.shift())
-                                            .unwrap())
-                                    } else {
-                                        Err(web_rpc::wasm_bindgen::JsCast::dyn_into::<#err_ty>(__post_array.shift())
-                                            .unwrap())
-                                    }
-                                }
-                            },
-                        }
-                    } else {
-                        quote! {
-                            |(__response, _post_array)| {
-                                let #response_ident::#camel_case_ident(__inner) = __response else {
-                                    panic!("received incorrect response variant")
-                                };
-                                __inner
-                            }
+                    let unpack_stream_item = quote! {
+                        |(__response, __post_array): (#response_ident, web_rpc::js_sys::Array)| {
+                            let #response_ident::#camel_case_ident(__wire) = __response else {
+                                panic!("web_rpc: received incorrect response variant")
+                            };
+                            #dec
                         }
                     };
 
@@ -593,12 +565,11 @@ impl<'a> ServiceGenerator<'a> {
                         }
                     }
                 } else {
-                    // Non-streaming (original logic)
                     let return_type = match output {
                         ReturnType::Type(_, ref ty) => quote! {
                             web_rpc::client::RequestFuture<#ty>
                         },
-                        _ => quote!(())
+                        _ => quote!(()),
                     };
                     let maybe_register_callback = match output {
                         ReturnType::Type(_, _) => quote! {
@@ -606,74 +577,32 @@ impl<'a> ServiceGenerator<'a> {
                                 web_rpc::futures_channel::oneshot::channel();
                             self.callback_map.borrow_mut().insert(__seq_id, __response_tx);
                         },
-                        _ => Default::default()
-                    };
-
-                    let unpack_response = if post.contains(&Ident::new("return", output.span())) {
-                        let unit_output: &Type = &parse_quote!(());
-                        let ret_ty = match output {
-                            ReturnType::Type(_, ref ty) => ty,
-                            _ => unit_output
-                        };
-                        match post_wrapper_kind(ret_ty) {
-                            PostWrapperKind::Bare => quote! {
-                                let (_, __post_response) = response;
-                                web_rpc::wasm_bindgen::JsCast::dyn_into::<#ret_ty>(__post_response.shift())
-                                    .unwrap()
-                            },
-                            PostWrapperKind::Option { inner_ty } => quote! {
-                                let (__serialize_response, __post_response) = response;
-                                let #response_ident::#camel_case_ident(__has_value) = __serialize_response else {
-                                    panic!("received incorrect response variant")
-                                };
-                                if __has_value {
-                                    Some(web_rpc::wasm_bindgen::JsCast::dyn_into::<#inner_ty>(__post_response.shift())
-                                        .unwrap())
-                                } else {
-                                    None
-                                }
-                            },
-                            PostWrapperKind::Result { ok_ty, err_ty } => quote! {
-                                let (__serialize_response, __post_response) = response;
-                                let #response_ident::#camel_case_ident(__is_ok) = __serialize_response else {
-                                    panic!("received incorrect response variant")
-                                };
-                                if __is_ok {
-                                    Ok(web_rpc::wasm_bindgen::JsCast::dyn_into::<#ok_ty>(__post_response.shift())
-                                        .unwrap())
-                                } else {
-                                    Err(web_rpc::wasm_bindgen::JsCast::dyn_into::<#err_ty>(__post_response.shift())
-                                        .unwrap())
-                                }
-                            },
-                        }
-                    } else {
-                        quote! {
-                            let (__serialize_response, _) = response;
-                            let #response_ident::#camel_case_ident(__inner) = __serialize_response else {
-                                panic!("received incorrect response variant")
-                            };
-                            __inner
-                        }
+                        _ => Default::default(),
                     };
 
                     let maybe_unpack_and_return_future = match output {
-                        ReturnType::Type(_, _) => quote! {
-                            let __response_future = web_rpc::futures_util::FutureExt::map(
-                                __response_rx,
-                                |response| {
-                                    let response = response.unwrap();
-                                    #unpack_response
-                                }
-                            );
-                            let __abort_sender = self.abort_sender.clone();
-                            let __dispatcher = self.dispatcher.clone();
-                            web_rpc::client::RequestFuture::new(
-                                __response_future,
-                                __dispatcher,
-                                std::boxed::Box::new(move || (__abort_sender)(__seq_id)))
-                        },
-                        _ => Default::default()
+                        ReturnType::Type(_, ref ret_ty) => {
+                            let dec = emit_decode(ret_ty, quote!(__wire), &quote!(&__post_array));
+                            quote! {
+                                let __response_future = web_rpc::futures_util::FutureExt::map(
+                                    __response_rx,
+                                    |response| {
+                                        let (__serialize_response, __post_array) = response.unwrap();
+                                        let #response_ident::#camel_case_ident(__wire) = __serialize_response else {
+                                            panic!("web_rpc: received incorrect response variant")
+                                        };
+                                        #dec
+                                    }
+                                );
+                                let __abort_sender = self.abort_sender.clone();
+                                let __dispatcher = self.dispatcher.clone();
+                                web_rpc::client::RequestFuture::new(
+                                    __response_future,
+                                    __dispatcher,
+                                    std::boxed::Box::new(move || (__abort_sender)(__seq_id)))
+                            }
+                        }
+                        _ => Default::default(),
                     };
 
                     quote! {
@@ -782,160 +711,111 @@ impl<'a> ServiceGenerator<'a> {
 
         let handlers = rpcs.iter()
             .zip(camel_case_idents.iter())
-            .map(|(RpcMethod { is_async, ident, args, transfer, post, output, .. }, camel_case_ident)| {
-                // Collect idents for request enum destructuring — non-post args
-                // plus wrapped post args (which are now bool/Result<(), E> discriminants)
-                let destructure_arg_idents: Vec<_> = args.iter()
-                    .filter_map(|arg| match &*arg.pat {
-                        Pat::Ident(pat_ident) => {
-                            let id = &pat_ident.ident;
-                            if post.contains(id) {
-                                // Only include if wrapped (bare post args are not in the enum)
-                                match post_wrapper_kind(&arg.ty) {
-                                    PostWrapperKind::Bare => None,
-                                    _ => Some(id),
-                                }
-                            } else {
-                                Some(id)
-                            }
-                        }
-                        _ => None
+            .map(|(RpcMethod { is_async, ident, args, transfer, output, .. }, camel_case_ident)| {
+                // 1. Destructure pattern for the request enum variant.
+                // Borrowed args use their own ident; non-borrowed args bind to __wire_<id>.
+                let destructure_fields: Vec<_> = args.iter()
+                    .filter_map(|arg| {
+                        let id = match &*arg.pat {
+                            Pat::Ident(p) => &p.ident,
+                            _ => return None,
+                        };
+                        Some(if is_borrowed_serde_ref(&arg.ty) {
+                            quote! { #id }
+                        } else {
+                            let wire_ident = format_ident!("__wire_{}", id);
+                            quote! { #id: #wire_ident }
+                        })
                     })
                     .collect();
-                let extract_js_args = args.iter()
-                    .filter_map(|arg| match &*arg.pat {
-                        Pat::Ident(pat_ident) if post.contains(&pat_ident.ident) => {
-                            let arg_pat = &arg.pat;
+
+                // 2. Per-arg decoding statements.
+                let arg_decodes: Vec<_> = args.iter()
+                    .filter_map(|arg| {
+                        let id = match &*arg.pat {
+                            Pat::Ident(p) => &p.ident,
+                            _ => return None,
+                        };
+                        if is_borrowed_serde_ref(&arg.ty) {
+                            // Already bound by destructuring.
+                            None
+                        } else if is_js_ref(&arg.ty) {
+                            // `&T` where T: JsCast — no `Decoder<&T>` impl, so we
+                            // shift from the post-array and bind via dyn_ref locally.
+                            let inner_ty = match &*arg.ty {
+                                Type::Reference(r) => &*r.elem,
+                                _ => unreachable!(),
+                            };
+                            let tmp_ident = format_ident!("__tmp_{}", id);
+                            let wire_ident = format_ident!("__wire_{}", id);
                             let arg_ty = &arg.ty;
-                            match post_wrapper_kind(arg_ty) {
-                                PostWrapperKind::Bare => {
-                                    // Original logic for bare post args
-                                    if let Type::Reference(type_ref) = &**arg_ty {
-                                        let inner_ty = &type_ref.elem;
-                                        let tmp_ident = format_ident!("__tmp_{}", pat_ident.ident);
-                                        Some(quote! {
-                                            let #tmp_ident = __js_args.shift();
-                                            let #arg_pat: #arg_ty = web_rpc::wasm_bindgen::JsCast::dyn_ref::<#inner_ty>(&#tmp_ident)
-                                                .unwrap();
-                                        })
-                                    } else {
-                                        Some(quote! {
-                                            let #arg_pat = web_rpc::wasm_bindgen::JsCast::dyn_into::<#arg_ty>(__js_args.shift())
-                                                .unwrap();
-                                        })
+                            Some(quote! {
+                                let #tmp_ident = match #wire_ident {
+                                    web_rpc::codec::WireArg::Js => __js_args.shift(),
+                                    _ => panic!("web_rpc: expected Js wire variant for reference arg"),
+                                };
+                                let #id: #arg_ty = web_rpc::wasm_bindgen::JsCast::dyn_ref::<#inner_ty>(&#tmp_ident)
+                                    .unwrap();
+                            })
+                        } else {
+                            let wire_ident = format_ident!("__wire_{}", id);
+                            let dec = emit_decode(&arg.ty, quote!(#wire_ident), &quote!(&__js_args));
+                            Some(quote! { let #id = #dec; })
+                        }
+                    })
+                    .collect();
+
+                let call_args: Vec<_> = args.iter().filter_map(|arg| match &*arg.pat {
+                    Pat::Ident(ident) => Some(&ident.ident),
+                    _ => None,
+                }).collect();
+
+                // Return-side transfer clauses (BareReturn / ReturnGated).
+                // The scrutinee is `__response` for non-streaming and `__item` for streaming.
+                let make_return_transfer = |scrutinee_ident: &Ident| -> TokenStream2 {
+                    let pushes = transfer.iter().filter_map(|c| match c {
+                        TransferClause::BareReturn => Some(quote! {
+                            __transfer.push(#scrutinee_ident.as_ref());
+                        }),
+                        TransferClause::ReturnGated { gates } => {
+                            let arms = gates.iter().map(|g| {
+                                let pat = &g.pat;
+                                let body = &g.body;
+                                quote_spanned! {body.span()=>
+                                    if let #pat = &#scrutinee_ident {
+                                        __transfer.push((#body).as_ref());
                                     }
                                 }
-                                PostWrapperKind::Option { inner_ty } => {
-                                    // `arg_pat` is already bound as bool from destructuring
-                                    // Shadow it with the reconstructed Option
-                                    Some(quote! {
-                                        let #arg_pat: #arg_ty = if #arg_pat {
-                                            Some(web_rpc::wasm_bindgen::JsCast::dyn_into::<#inner_ty>(__js_args.shift())
-                                                .unwrap())
-                                        } else {
-                                            None
-                                        };
-                                    })
-                                }
-                                PostWrapperKind::Result { ok_ty, .. } => {
-                                    // `arg_pat` is already bound as Result<(), E> from destructuring
-                                    // Shadow it with the reconstructed Result
-                                    Some(quote! {
-                                        let #arg_pat: #arg_ty = match #arg_pat {
-                                            Ok(()) => Ok(web_rpc::wasm_bindgen::JsCast::dyn_into::<#ok_ty>(__js_args.shift())
-                                                .unwrap()),
-                                            Err(__e) => Err(__e),
-                                        };
-                                    })
-                                }
-                            }
-                        },
-                        _ => None
+                            });
+                            Some(quote! { #( #arms )* })
+                        }
+                        _ => None,
                     });
+                    quote! { #( #pushes )* }
+                };
 
-                // Check if this is a streaming method
-                let is_streaming = matches!(output, ReturnType::Type(_, ref ty) if stream_item_type(ty).is_some());
+                let is_streaming = matches!(
+                    output,
+                    ReturnType::Type(_, ref ty) if stream_item_type(ty).is_some()
+                );
 
                 if is_streaming {
-                    let call_args = args.iter().filter_map(|arg| match &*arg.pat {
-                        Pat::Ident(ident) => Some(&ident.ident),
-                        _ => None
-                    });
-                    let return_ident = Ident::new("return", output.span());
-                    let is_post_return = post.contains(&return_ident);
-                    let is_transfer_return = transfer.contains(&return_ident);
                     let item_ty = match output {
                         ReturnType::Type(_, ref ty) => stream_item_type(ty).unwrap(),
                         _ => unreachable!(),
                     };
-                    let wrap_item = if !is_post_return {
-                        quote! {
-                            let __response = #response_ident::#camel_case_ident(__item);
-                            let __post = web_rpc::js_sys::Array::new();
-                            let __transfer = web_rpc::js_sys::Array::new();
-                        }
-                    } else {
-                        let wrapper_kind = post_wrapper_kind(item_ty);
-                        match wrapper_kind {
-                            PostWrapperKind::Bare => {
-                                let transfer_code = if is_transfer_return {
-                                    quote! { web_rpc::js_sys::Array::of1(__item.as_ref()) }
-                                } else {
-                                    quote! { web_rpc::js_sys::Array::new() }
-                                };
-                                quote! {
-                                    let __response = #response_ident::#camel_case_ident(());
-                                    let __post = web_rpc::js_sys::Array::of1(__item.as_ref());
-                                    let __transfer = #transfer_code;
-                                }
-                            }
-                            PostWrapperKind::Option { .. } => {
-                                let transfer_push = if is_transfer_return {
-                                    quote! { __transfer.push(__val.as_ref()); }
-                                } else {
-                                    quote! {}
-                                };
-                                quote! {
-                                    let (__response, __post, __transfer) = match __item {
-                                        Some(ref __val) => {
-                                            let __post = web_rpc::js_sys::Array::of1(__val.as_ref());
-                                            let __transfer = web_rpc::js_sys::Array::new();
-                                            #transfer_push
-                                            (#response_ident::#camel_case_ident(true), __post, __transfer)
-                                        }
-                                        None => {
-                                            (#response_ident::#camel_case_ident(false),
-                                             web_rpc::js_sys::Array::new(),
-                                             web_rpc::js_sys::Array::new())
-                                        }
-                                    };
-                                }
-                            }
-                            PostWrapperKind::Result { .. } => {
-                                let transfer_push = if is_transfer_return {
-                                    quote! { __transfer.push(__val.as_ref()); }
-                                } else {
-                                    quote! {}
-                                };
-                                quote! {
-                                    let (__response, __post, __transfer) = match __item {
-                                        Ok(ref __val) => {
-                                            let __post = web_rpc::js_sys::Array::of1(__val.as_ref());
-                                            let __transfer = web_rpc::js_sys::Array::new();
-                                            #transfer_push
-                                            (#response_ident::#camel_case_ident(true), __post, __transfer)
-                                        }
-                                        Err(ref __val) => {
-                                            let __post = web_rpc::js_sys::Array::of1(__val.as_ref());
-                                            let __transfer = web_rpc::js_sys::Array::new();
-                                            (#response_ident::#camel_case_ident(false), __post, __transfer)
-                                        }
-                                    };
-                                }
-                            }
-                        }
+                    let item_enc = emit_encode(item_ty, quote!(__item), &quote!(&__post));
+                    let item_ident = Ident::new("__item", proc_macro2::Span::call_site());
+                    let return_transfer = make_return_transfer(&item_ident);
+
+                    let wrap_item = quote! {
+                        let __post = web_rpc::js_sys::Array::new();
+                        let __transfer = web_rpc::js_sys::Array::new();
+                        let __wire_item = #item_enc;
+                        #return_transfer
+                        let __response = #response_ident::#camel_case_ident(__wire_item);
                     };
-                    // Build the forwarding closure (reused for both async/sync)
+
                     let fwd_body = quote! {
                         let __stream_tx_clone = __stream_tx.clone();
                         web_rpc::pin_utils::pin_mut!(__user_rx);
@@ -959,8 +839,8 @@ impl<'a> ServiceGenerator<'a> {
 
                     match is_async {
                         Some(_) => quote! {
-                            #request_ident::#camel_case_ident { #( #destructure_arg_idents ),* } => {
-                                #( #extract_js_args )*
+                            #request_ident::#camel_case_ident { #( #destructure_fields ),* } => {
+                                #( #arg_decodes )*
                                 let __get_rx = web_rpc::futures_util::FutureExt::fuse(
                                     self.server_impl.#ident(#( #call_args ),*)
                                 );
@@ -978,98 +858,46 @@ impl<'a> ServiceGenerator<'a> {
                             }
                         },
                         None => quote! {
-                            #request_ident::#camel_case_ident { #( #destructure_arg_idents ),* } => {
-                                #( #extract_js_args )*
+                            #request_ident::#camel_case_ident { #( #destructure_fields ),* } => {
+                                #( #arg_decodes )*
                                 let mut __user_rx = self.server_impl.#ident(#( #call_args ),*);
                                 #fwd_body
                             }
                         },
                     }
                 } else {
-                    // Non-streaming (original logic, but wrapped in ExecuteResult::Response)
-                    let return_ident = Ident::new("return", output.span());
-                    let is_post_return = post.contains(&return_ident);
-                    let is_transfer_return = transfer.contains(&return_ident);
-                    let ret_ty = match output {
-                        ReturnType::Type(_, ref ty) => Some(ty.as_ref()),
-                        _ => None,
-                    };
-                    let return_response = if !is_post_return {
-                        quote! {
-                            let __post = web_rpc::js_sys::Array::new();
-                            let __transfer = web_rpc::js_sys::Array::new();
-                            (#response_ident::#camel_case_ident(__response), __post, __transfer)
+                    // Non-streaming.
+                    let resp_ident = Ident::new("__response", proc_macro2::Span::call_site());
+                    let return_transfer = make_return_transfer(&resp_ident);
+                    let return_response = match output {
+                        ReturnType::Type(_, ref ret_ty) => {
+                            let enc = emit_encode(ret_ty, quote!(__response), &quote!(&__post));
+                            quote! {
+                                let __post = web_rpc::js_sys::Array::new();
+                                let __transfer = web_rpc::js_sys::Array::new();
+                                let __wire = #enc;
+                                #return_transfer
+                                (#response_ident::#camel_case_ident(__wire), __post, __transfer)
+                            }
                         }
-                    } else {
-                        let wrapper_kind = ret_ty.map(|ty| post_wrapper_kind(ty));
-                        match wrapper_kind {
-                            Some(PostWrapperKind::Option { .. }) => {
-                                let transfer_push = if is_transfer_return {
-                                    quote! { __transfer.push(__val.as_ref()); }
-                                } else {
-                                    quote! {}
-                                };
-                                quote! {
-                                    match __response {
-                                        Some(ref __val) => {
-                                            let __post = web_rpc::js_sys::Array::of1(__val.as_ref());
-                                            let __transfer = web_rpc::js_sys::Array::new();
-                                            #transfer_push
-                                            (#response_ident::#camel_case_ident(true), __post, __transfer)
-                                        }
-                                        None => {
-                                            (#response_ident::#camel_case_ident(false),
-                                             web_rpc::js_sys::Array::new(),
-                                             web_rpc::js_sys::Array::new())
-                                        }
-                                    }
-                                }
-                            }
-                            Some(PostWrapperKind::Result { .. }) => {
-                                let transfer_push = if is_transfer_return {
-                                    quote! { __transfer.push(__val.as_ref()); }
-                                } else {
-                                    quote! {}
-                                };
-                                quote! {
-                                    match __response {
-                                        Ok(ref __val) => {
-                                            let __post = web_rpc::js_sys::Array::of1(__val.as_ref());
-                                            let __transfer = web_rpc::js_sys::Array::new();
-                                            #transfer_push
-                                            (#response_ident::#camel_case_ident(true), __post, __transfer)
-                                        }
-                                        Err(ref __val) => {
-                                            let __post = web_rpc::js_sys::Array::of1(__val.as_ref());
-                                            let __transfer = web_rpc::js_sys::Array::new();
-                                            (#response_ident::#camel_case_ident(false), __post, __transfer)
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {
-                                // Bare post return
-                                let transfer_code = if is_transfer_return {
-                                    quote! { web_rpc::js_sys::Array::of1(__response.as_ref()) }
-                                } else {
-                                    quote! { web_rpc::js_sys::Array::new() }
-                                };
-                                quote! {
-                                    let __post = web_rpc::js_sys::Array::of1(__response.as_ref());
-                                    let __transfer = #transfer_code;
-                                    (#response_ident::#camel_case_ident(()), __post, __transfer)
-                                }
+                        _ => {
+                            // Notification — emit a placeholder WireArg.
+                            quote! {
+                                let _ = __response;
+                                let __post = web_rpc::js_sys::Array::new();
+                                let __transfer = web_rpc::js_sys::Array::new();
+                                let __wire = web_rpc::codec::WireArg::Bytes(
+                                    web_rpc::bincode::serialize(&()).unwrap()
+                                );
+                                (#response_ident::#camel_case_ident(__wire), __post, __transfer)
                             }
                         }
                     };
-                    let call_args = args.iter().filter_map(|arg| match &*arg.pat {
-                        Pat::Ident(ident) => Some(&ident.ident),
-                        _ => None
-                    });
+
                     match is_async {
                         Some(_) => quote! {
-                            #request_ident::#camel_case_ident { #( #destructure_arg_idents ),* } => {
-                                #( #extract_js_args )*
+                            #request_ident::#camel_case_ident { #( #destructure_fields ),* } => {
+                                #( #arg_decodes )*
                                 let __task =
                                     web_rpc::futures_util::FutureExt::fuse(self.server_impl.#ident(#( #call_args ),*));
                                 web_rpc::pin_utils::pin_mut!(__task);
@@ -1084,8 +912,8 @@ impl<'a> ServiceGenerator<'a> {
                             }
                         },
                         None => quote! {
-                            #request_ident::#camel_case_ident { #( #destructure_arg_idents ),* } => {
-                                #( #extract_js_args )*
+                            #request_ident::#camel_case_ident { #( #destructure_fields ),* } => {
+                                #( #arg_decodes )*
                                 let __response = self.server_impl.#ident(#( #call_args ),*);
                                 web_rpc::service::ExecuteResult::Response(
                                     Some({
@@ -1164,89 +992,142 @@ impl Parse for Service {
     }
 }
 
+/// Parsed RHS of a `name => ...` or `return => ...` clause.
+enum TransferRhs {
+    Expr(syn::Expr),
+    Gates(Vec<Gate>),
+}
+
+fn parse_transfer_rhs(input: ParseStream) -> syn::Result<TransferRhs> {
+    if input.peek(Token![|]) || input.peek(Token![||]) {
+        // Closure form: `|pat| body` (or `|| body` — rejected).
+        let closure: syn::ExprClosure = input.parse()?;
+        if closure.inputs.len() != 1 {
+            return Err(syn::Error::new_spanned(
+                &closure,
+                "transfer closure must have exactly one parameter",
+            ));
+        }
+        let pat = closure.inputs.into_iter().next().unwrap();
+        let body = *closure.body;
+        Ok(TransferRhs::Gates(vec![Gate { pat, body }]))
+    } else if input.peek(Token![match]) {
+        // `match { arms }` — no scrutinee. Bespoke syntax.
+        input.parse::<Token![match]>()?;
+        let content;
+        braced!(content in input);
+        let arms: Punctuated<syn::Arm, Token![,]> =
+            content.parse_terminated(syn::Arm::parse)?;
+        let gates = arms
+            .into_iter()
+            .map(|a| Gate {
+                pat: a.pat,
+                body: *a.body,
+            })
+            .collect();
+        Ok(TransferRhs::Gates(gates))
+    } else {
+        // Bare expression — only valid for params; the caller checks.
+        let body: syn::Expr = input.parse()?;
+        Ok(TransferRhs::Expr(body))
+    }
+}
+
+impl Parse for TransferClause {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let is_return = input.peek(Token![return]);
+        let lhs_name: Option<Ident> = if is_return {
+            input.parse::<Token![return]>()?;
+            None
+        } else {
+            Some(input.parse()?)
+        };
+
+        if input.peek(Token![=>]) {
+            input.parse::<Token![=>]>()?;
+            let rhs = parse_transfer_rhs(input)?;
+            match (lhs_name, rhs) {
+                (Some(name), TransferRhs::Expr(body)) => {
+                    Ok(TransferClause::ParamExpr { name, body })
+                }
+                (Some(name), TransferRhs::Gates(gates)) => {
+                    Ok(TransferClause::ParamGated { name, gates })
+                }
+                (None, TransferRhs::Gates(gates)) => {
+                    Ok(TransferClause::ReturnGated { gates })
+                }
+                (None, TransferRhs::Expr(_)) => Err(syn::Error::new(
+                    input.span(),
+                    "`return =>` requires a closure (`|pat| body`) or `match { arms }` block",
+                )),
+            }
+        } else {
+            Ok(match lhs_name {
+                Some(name) => TransferClause::BareParam(name),
+                None => TransferClause::BareReturn,
+            })
+        }
+    }
+}
+
 impl Parse for RpcMethod {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut errors = Ok(());
         let attrs = input.call(Attribute::parse_outer)?;
-        let (post_attrs, attrs): (Vec<_>, Vec<_>) = attrs.into_iter().partition(|attr| {
+
+        // Reject the removed `#[post(...)]` attribute with a migration message.
+        for attr in &attrs {
+            if attr
+                .path
+                .segments
+                .last()
+                .is_some_and(|seg| seg.ident == "post")
+            {
+                extend_errors!(
+                    errors,
+                    syn::Error::new_spanned(
+                        attr,
+                        "`#[post(...)]` has been removed. JS-vs-serialize routing is now \
+                         inferred from each argument and return type. For transfer semantics, \
+                         use `#[transfer(...)]` (e.g. `#[transfer(canvas)]`, \
+                         `#[transfer(data => data.buffer())]`, or \
+                         `#[transfer(return => |Ok(o)| o.buffer())]`)."
+                    )
+                );
+            }
+        }
+
+        // Partition out the new `#[transfer(...)]` attribute(s).
+        let (transfer_attrs, attrs): (Vec<_>, Vec<_>) = attrs.into_iter().partition(|attr| {
             attr.path
                 .segments
                 .last()
-                .is_some_and(|last_segment| last_segment.ident == "post")
+                .is_some_and(|last_segment| last_segment.ident == "transfer")
         });
-        let mut transfer: HashSet<Ident> = HashSet::new();
-        let mut post: HashSet<Ident> = HashSet::new();
-        for post_attr in post_attrs {
-            let parsed_args =
-                post_attr.parse_args_with(Punctuated::<NestedMeta, Token![,]>::parse_terminated)?;
-            for parsed_arg in parsed_args {
-                match &parsed_arg {
-                    NestedMeta::Meta(meta) => match meta {
-                        Meta::Path(path) => {
-                            if let Some(segment) = path.segments.last() {
-                                post.insert(segment.ident.clone());
-                            }
-                        }
-                        Meta::List(list) => match list.path.segments.last() {
-                            Some(last_segment) if last_segment.ident == "transfer" => {
-                                if list.nested.len() != 1 {
-                                    extend_errors!(
-                                        errors,
-                                        syn::Error::new(
-                                            parsed_arg.span(),
-                                            "Syntax error in post attribute"
-                                        )
-                                    );
-                                }
-                                match list.nested.first() {
-                                    Some(NestedMeta::Meta(Meta::Path(path))) => {
-                                        match path.segments.last() {
-                                            Some(segment) => {
-                                                post.insert(segment.ident.clone());
-                                                transfer.insert(segment.ident.clone());
-                                            }
-                                            _ => extend_errors!(
-                                                errors,
-                                                syn::Error::new(
-                                                    parsed_arg.span(),
-                                                    "Syntax error in post attribute"
-                                                )
-                                            ),
-                                        }
-                                    }
-                                    _ => extend_errors!(
-                                        errors,
-                                        syn::Error::new(
-                                            parsed_arg.span(),
-                                            "Syntax error in post attribute"
-                                        )
-                                    ),
-                                }
-                            }
-                            _ => extend_errors!(
-                                errors,
-                                syn::Error::new(
-                                    parsed_arg.span(),
-                                    "Syntax error in post attribute"
-                                )
-                            ),
-                        },
-                        _ => extend_errors!(
-                            errors,
-                            syn::Error::new(parsed_arg.span(), "Syntax error in post attribute")
-                        ),
-                    },
-                    _ => extend_errors!(
-                        errors,
-                        syn::Error::new(parsed_arg.span(), "Syntax error in post attribute")
-                    ),
-                }
-            }
+        let mut transfer: Vec<TransferClause> = Vec::new();
+        for transfer_attr in transfer_attrs {
+            let parsed = transfer_attr
+                .parse_args_with(Punctuated::<TransferClause, Token![,]>::parse_terminated)?;
+            transfer.extend(parsed.into_iter());
         }
 
         let is_async = input.parse::<Token![async]>().ok();
         input.parse::<Token![fn]>()?;
         let ident: Ident = input.parse()?;
+
+        // Reject generic methods up front — autoref dispatch needs concrete types.
+        if input.peek(Token![<]) {
+            let generics: syn::Generics = input.parse()?;
+            extend_errors!(
+                errors,
+                syn::Error::new_spanned(
+                    generics,
+                    "web_rpc::service trait methods may not have generic parameters; \
+                     concrete types are required so the macro can route each argument."
+                )
+            );
+        }
+
         let content;
         parenthesized!(content in input);
         let mut receiver: Option<syn::Receiver> = None;
@@ -1254,16 +1135,21 @@ impl Parse for RpcMethod {
         for arg in content.parse_terminated::<FnArg, Comma>(FnArg::parse)? {
             match arg {
                 FnArg::Typed(captured) => match &*captured.pat {
-                    Pat::Ident(_) => args.push(captured),
-                    _ => {
-                        extend_errors!(
-                            errors,
-                            syn::Error::new(
-                                captured.pat.span(),
-                                "patterns are not allowed in RPC arguments"
-                            )
-                        )
+                    Pat::Ident(_) => {
+                        // Reject reference args other than `&str`/`&[u8]`/`&JsT`.
+                        // (The is_js_ref / is_borrowed_serde_ref classifiers will
+                        // accept any reference; we let them through here and rely
+                        // on the receiver-side decoder to fail on unsupported
+                        // shapes. A dedicated diagnostic comes later.)
+                        args.push(captured)
                     }
+                    _ => extend_errors!(
+                        errors,
+                        syn::Error::new(
+                            captured.pat.span(),
+                            "patterns are not allowed in RPC arguments"
+                        )
+                    ),
                 },
                 FnArg::Receiver(ref recv) => {
                     if recv.reference.is_none() || recv.mutability.is_some() {
@@ -1295,6 +1181,8 @@ impl Parse for RpcMethod {
         let output: ReturnType = input.parse()?;
         input.parse::<Token![;]>()?;
 
+        // Validate that every transfer clause references a real parameter
+        // (or `return`, which has no name to check).
         let arg_names: HashSet<_> = args
             .iter()
             .filter_map(|arg| match &*arg.pat {
@@ -1302,27 +1190,26 @@ impl Parse for RpcMethod {
                 _ => None,
             })
             .collect();
-        let return_ident = Ident::new("return", output.span());
-        for ident in &post {
-            if *ident != return_ident && !arg_names.contains(ident) {
-                extend_errors!(
-                    errors,
-                    syn::Error::new(
-                        ident.span(),
-                        format!("`{}` does not match any parameter", ident)
-                    )
-                );
-            }
-        }
-        for ident in &transfer {
-            if *ident != return_ident && !post.contains(ident) {
-                extend_errors!(
-                    errors,
-                    syn::Error::new(
-                        ident.span(),
-                        format!("`{}` is marked as transfer but not as post", ident)
-                    )
-                );
+        for clause in &transfer {
+            let name_ref = match clause {
+                TransferClause::BareParam(name)
+                | TransferClause::ParamExpr { name, .. }
+                | TransferClause::ParamGated { name, .. } => Some(name),
+                TransferClause::BareReturn | TransferClause::ReturnGated { .. } => None,
+            };
+            if let Some(name) = name_ref {
+                if !arg_names.contains(name) {
+                    extend_errors!(
+                        errors,
+                        syn::Error::new(
+                            name.span(),
+                            format!(
+                                "`{}` in #[transfer(...)] does not match any parameter",
+                                name
+                            )
+                        )
+                    );
+                }
             }
         }
         errors?;
@@ -1333,7 +1220,6 @@ impl Parse for RpcMethod {
             receiver,
             ident,
             args,
-            post,
             transfer,
             output,
         })
@@ -1359,12 +1245,9 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
         .map(|rpc| snake_to_camel(&rpc.ident.unraw().to_string()))
         .collect();
 
-    let has_borrowed_args = rpcs.iter().any(|rpc| {
-        rpc.args.iter().any(|arg| {
-            matches!(&*arg.pat, Pat::Ident(pat_ident) if !rpc.post.contains(&pat_ident.ident))
-                && matches!(&*arg.ty, Type::Reference(_))
-        })
-    });
+    let has_borrowed_args = rpcs
+        .iter()
+        .any(|rpc| rpc.args.iter().any(|arg| is_borrowed_serde_ref(&arg.ty)));
 
     let has_streaming_methods = rpcs.iter().any(
         |rpc| matches!(&rpc.output, ReturnType::Type(_, ref ty) if stream_item_type(ty).is_some()),

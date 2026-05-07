@@ -3,7 +3,6 @@ use wasm_bindgen_test::*;
 
 #[web_rpc::service]
 pub trait Concat {
-    #[post(left, right, return)]
     fn concat_with_space(
         &self,
         left: &js_sys::JsString,

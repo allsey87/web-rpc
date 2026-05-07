@@ -6,7 +6,6 @@ use wasm_bindgen_test::*;
 
 #[web_rpc::service]
 pub trait OptionalReturn {
-    #[post(return)]
     fn maybe_string(&self, return_some: bool) -> Option<js_sys::JsString>;
 }
 
@@ -69,7 +68,6 @@ async fn option_post_return_none() {
 
 #[web_rpc::service]
 pub trait FallibleReturn {
-    #[post(return)]
     fn try_string(&self, succeed: bool) -> Result<js_sys::JsString, js_sys::Error>;
 }
 
@@ -134,7 +132,6 @@ async fn result_post_return_err() {
 
 #[web_rpc::service]
 pub trait OptionalArg {
-    #[post(value)]
     fn string_len(&self, value: Option<js_sys::JsString>) -> u32;
 }
 
@@ -195,7 +192,6 @@ async fn option_post_arg_none() {
 
 #[web_rpc::service]
 pub trait StreamOptional {
-    #[post(return)]
     fn stream_maybe(&self, count: u32) -> impl Stream<Item = Option<js_sys::JsString>>;
 }
 
@@ -244,7 +240,6 @@ async fn streaming_option_post_return() {
 
 #[web_rpc::service]
 pub trait StreamFallible {
-    #[post(return)]
     fn stream_results(
         &self,
         count: u32,
