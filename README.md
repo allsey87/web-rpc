@@ -52,5 +52,6 @@ assert_eq!(client.add(41, 1).await, 42);
 - **Async or sync** server methods, with per-request cancellation when the client drops the future of an RPC method that returns.
 - **Notifications**: methods with no return type are fire-and-forget.
 - **Borrowed `&str` / `&[u8]`**: zero-copy deserialization on the server side.
+- **Conditional methods**: `#[cfg(...)]` on a trait method is propagated to all generated code, so the method is stripped from the client, server, and wire format when the cfg is off.
 
 See the [crate documentation](https://docs.rs/web-rpc/latest/web_rpc/) for the full feature reference. Need help with your latest project? Get in touch via [contact@allwright.io](mailto:contact@allwright.io). I'm available for new assignments.

@@ -109,6 +109,13 @@ fn is_js_ref(ty: &Type) -> bool {
     matches!(ty, Type::Reference(_)) && !is_borrowed_serde_ref(ty)
 }
 
+/// True if `attr` is a cfg-style attribute (`#[cfg(...)]` or `#[cfg_attr(...)]`).
+/// These are propagated onto every generated artifact derived from a method so
+/// that rustc strips them in lockstep after macro expansion.
+fn is_cfg_attr(attr: &Attribute) -> bool {
+    attr.path.is_ident("cfg") || attr.path.is_ident("cfg_attr")
+}
+
 /// Recursively emit code that encodes a value of type `ty` into a `WireArg`,
 /// pushing JS values onto `post` as a side-effect.
 ///
@@ -251,7 +258,6 @@ struct ServiceGenerator<'a> {
     attrs: &'a [Attribute],
     rpcs: &'a [RpcMethod],
     camel_case_idents: &'a [Ident],
-    has_borrowed_args: bool,
     has_streaming_methods: bool,
 }
 
@@ -262,16 +268,11 @@ impl<'a> ServiceGenerator<'a> {
             request_ident,
             camel_case_idents,
             rpcs,
-            has_borrowed_args,
             ..
         } = self;
-        let lifetime = if has_borrowed_args {
-            quote!(<'a>)
-        } else {
-            quote!()
-        };
         let variants = rpcs.iter().zip(camel_case_idents.iter()).map(
-            |(RpcMethod { args, .. }, camel_case_ident)| {
+            |(RpcMethod { attrs, args, .. }, camel_case_ident)| {
+                let cfg_attrs = attrs.iter().filter(|a| is_cfg_attr(a));
                 let fields = args.iter().map(|arg| {
                     let pat = &arg.pat;
                     if is_borrowed_serde_ref(&arg.ty) {
@@ -292,14 +293,23 @@ impl<'a> ServiceGenerator<'a> {
                     }
                 });
                 quote! {
+                    #(#cfg_attrs)*
                     #camel_case_ident { #( #fields ),* }
                 }
             },
         );
+        // `<'a>` is always emitted, with a hidden variant that uses it via
+        // `PhantomData`. This keeps the enum well-formed regardless of which
+        // methods rustc strips via cfg-evaluation after macro expansion: a
+        // service whose only borrowing methods get cfg'd out would otherwise
+        // hit E0392. The macro never constructs this variant on the wire; the
+        // server's match arm panics if it ever appears.
         quote! {
             #[derive(web_rpc::serde::Serialize, web_rpc::serde::Deserialize)]
-            #vis enum #request_ident #lifetime {
-                #( #variants ),*
+            #vis enum #request_ident<'a> {
+                #( #variants, )*
+                #[doc(hidden)]
+                __WebRpcPhantom(std::marker::PhantomData<&'a ()>),
             }
         }
     }
@@ -313,12 +323,14 @@ impl<'a> ServiceGenerator<'a> {
             ..
         } = self;
         let variants = rpcs.iter().zip(camel_case_idents.iter()).map(
-            |(_method, camel_case_ident)| {
+            |(RpcMethod { attrs, .. }, camel_case_ident)| {
+                let cfg_attrs = attrs.iter().filter(|a| is_cfg_attr(a));
                 // Every method's response variant carries a single uniform
                 // `WireArg`. Notification methods (no return) still get a
                 // variant — the macro fills it with a placeholder that the
                 // client never reads.
                 quote! {
+                    #(#cfg_attrs)*
                     #camel_case_ident ( web_rpc::codec::WireArg )
                 }
             },
@@ -620,7 +632,11 @@ impl<'a> ServiceGenerator<'a> {
             });
 
         let stream_callback_map_field = if has_streaming_methods {
+            // `#[allow(dead_code)]` covers the case where every streaming method
+            // is stripped via cfg — the field is still bound by the
+            // `From<Configuration>` impl but no surviving method reads it.
             quote! {
+                #[allow(dead_code)]
                 stream_callback_map: std::rc::Rc<
                     std::cell::RefCell<
                         web_rpc::client::StreamCallbackMap<#response_ident>
@@ -699,19 +715,15 @@ impl<'a> ServiceGenerator<'a> {
             response_ident,
             camel_case_idents,
             rpcs,
-            has_borrowed_args,
             ..
         } = self;
 
-        let request_type = if has_borrowed_args {
-            quote! { #request_ident<'_> }
-        } else {
-            quote! { #request_ident }
-        };
+        let request_type = quote! { #request_ident<'_> };
 
         let handlers = rpcs.iter()
             .zip(camel_case_idents.iter())
-            .map(|(RpcMethod { is_async, ident, args, transfer, output, .. }, camel_case_ident)| {
+            .map(|(RpcMethod { is_async, ident, args, transfer, output, attrs, .. }, camel_case_ident)| {
+                let cfg_attrs: Vec<_> = attrs.iter().filter(|a| is_cfg_attr(a)).collect();
                 // 1. Destructure pattern for the request enum variant.
                 // Borrowed args use their own ident; non-borrowed args bind to __wire_<id>.
                 let destructure_fields: Vec<_> = args.iter()
@@ -839,6 +851,7 @@ impl<'a> ServiceGenerator<'a> {
 
                     match is_async {
                         Some(_) => quote! {
+                            #( #cfg_attrs )*
                             #request_ident::#camel_case_ident { #( #destructure_fields ),* } => {
                                 #( #arg_decodes )*
                                 let __get_rx = web_rpc::futures_util::FutureExt::fuse(
@@ -858,6 +871,7 @@ impl<'a> ServiceGenerator<'a> {
                             }
                         },
                         None => quote! {
+                            #( #cfg_attrs )*
                             #request_ident::#camel_case_ident { #( #destructure_fields ),* } => {
                                 #( #arg_decodes )*
                                 let mut __user_rx = self.server_impl.#ident(#( #call_args ),*);
@@ -896,6 +910,7 @@ impl<'a> ServiceGenerator<'a> {
 
                     match is_async {
                         Some(_) => quote! {
+                            #( #cfg_attrs )*
                             #request_ident::#camel_case_ident { #( #destructure_fields ),* } => {
                                 #( #arg_decodes )*
                                 let __task =
@@ -912,6 +927,7 @@ impl<'a> ServiceGenerator<'a> {
                             }
                         },
                         None => quote! {
+                            #( #cfg_attrs )*
                             #request_ident::#camel_case_ident { #( #destructure_fields ),* } => {
                                 #( #arg_decodes )*
                                 let __response = self.server_impl.#ident(#( #call_args ),*);
@@ -945,6 +961,9 @@ impl<'a> ServiceGenerator<'a> {
                     let __request: #request_type = web_rpc::bincode::deserialize(&__payload).unwrap();
                     let __result = match __request {
                         #( #handlers )*
+                        #request_ident::__WebRpcPhantom(_) => {
+                            unreachable!("web_rpc: __WebRpcPhantom variant received on wire")
+                        }
                     };
                     (__seq_id, __result)
                 }
@@ -1245,10 +1264,6 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
         .map(|rpc| snake_to_camel(&rpc.ident.unraw().to_string()))
         .collect();
 
-    let has_borrowed_args = rpcs
-        .iter()
-        .any(|rpc| rpc.args.iter().any(|arg| is_borrowed_serde_ref(&arg.ty)));
-
     let has_streaming_methods = rpcs.iter().any(
         |rpc| matches!(&rpc.output, ReturnType::Type(_, ref ty) if stream_item_type(ty).is_some()),
     );
@@ -1267,7 +1282,6 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
             .zip(camel_case_fn_names.iter())
             .map(|(rpc, name)| Ident::new(name, rpc.ident.span()))
             .collect::<Vec<_>>(),
-        has_borrowed_args,
         has_streaming_methods,
     }
     .into_token_stream()

@@ -123,6 +123,21 @@
 //! }
 //! ```
 //!
+//! # Conditional methods
+//! Methods can be gated with `#[cfg(...)]` or `#[cfg_attr(...)]`. The macro propagates these
+//! attributes to every generated artifact for that method, so rustc strips them in lockstep.
+//! ```rust
+//! #[web_rpc::service]
+//! pub trait Conditional {
+//!     fn always_on(&self, x: u32) -> u32;
+//!     #[cfg(feature = "extra")]
+//!     fn extra(&self, s: &str) -> String;
+//! }
+//! ```
+//! Bincode encodes enum variants by their positional discriminant, so the set of methods
+//! that survive cfg evaluation must match on both ends of a channel. If one side has a gated
+//! method enabled and the other does not, the wire format will silently desync.
+//!
 //! # Bi-directional
 //! Both sides of a channel can be set up to act as both client and server at the same time. To
 //! do this, stack [`with_service`](Builder::with_service) and

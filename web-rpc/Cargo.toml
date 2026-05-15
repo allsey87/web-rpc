@@ -11,6 +11,10 @@ license.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# Exercises the `#[cfg(feature = "...")]`-on-method test cases.
+extra = []
+
 [dependencies]
 web-rpc-macro = { path = "../web-rpc-macro", version = "0.0.6" }
 bincode = "1.3.3"
