@@ -505,7 +505,7 @@ dependencies = [
 
 [[package]]
 name = "web-rpc"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "console_error_panic_hook",
  "futures-channel",
@@ -526,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "web-rpc-macro"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "proc-macro2",
  "quote",
