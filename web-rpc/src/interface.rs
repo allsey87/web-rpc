@@ -15,6 +15,10 @@ impl Interface {
     /// [`web_sys::MessagePort`], a [`web_sys::Worker`], or a
     /// [`web_sys::DedicatedWorkerGlobalScope`]. This function is async and resolves to the new
     /// interface instance once the other side of the channel is ready.
+    ///
+    /// The transport is used, not owned: a [`web_sys::MessagePort`] must have been
+    /// [`start`](web_sys::MessagePort::start)ed by its owner before it is passed here, or the
+    /// handshake never completes.
     pub async fn new(port: impl Into<crate::port::Port>) -> Self {
         let port = port.into();
         let (dispatcher_tx, dispatcher_rx) = mpsc::unbounded();
@@ -36,19 +40,16 @@ impl Interface {
                     }
                 }
             });
-        /* needed for MessagePort */
-        port.start();
         /* poll other end of the channel */
         let port_cloned = port.clone();
-        let poll = async move {
+        let poll = std::pin::pin!(async move {
             loop {
                 port_cloned
                     .post_message(&JsValue::NULL, &JsValue::UNDEFINED)
                     .unwrap();
                 gloo_timers::future::TimeoutFuture::new(10).await;
             }
-        };
-        pin_utils::pin_mut!(poll);
+        });
         future::select(ready_rx, poll).await;
         /* at this point we know the other end's listener is available, but we may
         need to send one last message to indicate that we are available */

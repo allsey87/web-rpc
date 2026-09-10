@@ -1,14 +1,20 @@
+//! A `MessagePort` transferred through one connection carries a second connection.
+
+mod common;
+
 use std::sync::OnceLock;
 
 use futures_util::{future::RemoteHandle, FutureExt};
 use wasm_bindgen_test::*;
+use web_rpc::wrap::Transfer;
 
 #[web_rpc::service]
 pub trait FortyTwo {
     fn forty_two(&self) -> u32;
 }
-struct FortyTwoServiceImpl;
-impl FortyTwo for FortyTwoServiceImpl {
+
+struct FortyTwoImpl;
+impl FortyTwo for FortyTwoImpl {
     fn forty_two(&self) -> u32 {
         42
     }
@@ -16,69 +22,41 @@ impl FortyTwo for FortyTwoServiceImpl {
 
 #[web_rpc::service]
 pub trait Channel {
-    #[transfer(return)]
-    fn start(&self) -> web_sys::MessagePort;
+    fn start(&self) -> Transfer<web_sys::MessagePort>;
 }
 
 #[derive(Default)]
-struct ChannelServiceImpl {
-    server_handle: OnceLock<RemoteHandle<()>>,
+struct ChannelImpl {
+    server: OnceLock<RemoteHandle<()>>,
 }
 
-impl Channel for ChannelServiceImpl {
-    fn start(&self) -> web_sys::MessagePort {
-        /* create channel */
-        let channel = web_sys::MessageChannel::new().unwrap();
-        /* web_rpc::Interface::new will not complete until the same operation
-        is performed on port2, hence we combine these futures and spawn it
-        on the event loop, before returning port2 to the client */
-        let (server, server_handle) = web_rpc::Interface::new(channel.port1())
+impl Channel for ChannelImpl {
+    fn start(&self) -> Transfer<web_sys::MessagePort> {
+        let channel = common::channel();
+        // The handshake completes only once the client has the other port, so the server is
+        // spawned rather than awaited here.
+        let (server, handle) = web_rpc::Interface::new(channel.port1())
             .then(|interface| {
                 web_rpc::Builder::new(interface)
-                    .with_service::<FortyTwoService<_>>(FortyTwoServiceImpl)
+                    .with_service::<FortyTwoService<_>>(FortyTwoImpl)
                     .build()
             })
             .remote_handle();
         wasm_bindgen_futures::spawn_local(server);
-        /* store the server_handle inside the struct so that it is not dropped */
-        self.server_handle
-            .set(server_handle)
-            .map_err(|_| "OnceLock already set")
-            .unwrap();
-        /* return the second port */
-        channel.port2()
+        assert!(self.server.set(handle).is_ok(), "started twice");
+        Transfer(channel.port2())
     }
 }
 
 #[wasm_bindgen_test]
 async fn inception() {
-    console_error_panic_hook::set_once();
-    /* create channel */
-    let channel = web_sys::MessageChannel::new().unwrap();
-    let (server_interface, client_interface) = futures_util::future::join(
-        web_rpc::Interface::new(channel.port1()),
-        web_rpc::Interface::new(channel.port2()),
-    )
-    .await;
-    /* create and spawn server (shuts down when _server_handle is dropped) */
-    let (server, _server_handle) = web_rpc::Builder::new(server_interface)
-        .with_service::<ChannelService<_>>(ChannelServiceImpl::default())
-        .build()
-        .remote_handle();
-    wasm_bindgen_futures::spawn_local(server);
-    /* create client */
-    let client = web_rpc::Builder::new(client_interface)
-        .with_client::<ChannelClient>()
+    let (client, _server) =
+        common::connect::<ChannelService<_>, ChannelClient>(ChannelImpl::default()).await;
+    let port = client.start().await.into_inner();
+    // The transferred port is ours, so starting it is ours too.
+    port.start();
+    let inner = web_rpc::Builder::new(web_rpc::Interface::new(port).await)
+        .with_client::<FortyTwoClient>()
         .build();
-    /* run test */
-    let remote_client = client
-        .start()
-        .then(web_rpc::Interface::new)
-        .map(|interface| {
-            web_rpc::Builder::new(interface)
-                .with_client::<FortyTwoClient>()
-                .build()
-        })
-        .await;
-    assert_eq!(remote_client.forty_two().await, 42);
+    assert_eq!(inner.forty_two().await, 42);
 }

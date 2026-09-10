@@ -1,14 +1,15 @@
+mod common;
+
 use futures_util::{future::join, FutureExt};
 use wasm_bindgen_test::*;
 
-/* define the service */
 #[web_rpc::service]
 pub trait Calculator {
     fn add(&self, left: u32, right: u32) -> u32;
 }
-/* implement the server */
-struct CalculatorServiceImpl;
-impl Calculator for CalculatorServiceImpl {
+
+struct CalculatorImpl;
+impl Calculator for CalculatorImpl {
     fn add(&self, left: u32, right: u32) -> u32 {
         left + right
     }
@@ -17,31 +18,23 @@ impl Calculator for CalculatorServiceImpl {
 #[wasm_bindgen_test]
 async fn bidirectional() {
     console_error_panic_hook::set_once();
-    /* create channel */
-    let channel = web_sys::MessageChannel::new().unwrap();
-    let (interface1, interface2) = futures_util::future::join(
+    let channel = common::channel();
+    let (interface1, interface2) = join(
         web_rpc::Interface::new(channel.port1()),
         web_rpc::Interface::new(channel.port2()),
     )
     .await;
-    /* create server1 and client1 */
     let (client1, server1) = web_rpc::Builder::new(interface1)
-        .with_service::<CalculatorService<_>>(CalculatorServiceImpl)
+        .with_service::<CalculatorService<_>>(CalculatorImpl)
         .with_client::<CalculatorClient>()
         .build();
-    /* create server2 and client2 */
     let (client2, server2) = web_rpc::Builder::new(interface2)
-        .with_service::<CalculatorService<_>>(CalculatorServiceImpl)
+        .with_service::<CalculatorService<_>>(CalculatorImpl)
         .with_client::<CalculatorClient>()
         .build();
-    /* spawn the servers */
-    let (server1, _server_handle1) = server1.remote_handle();
-    let (server2, _server_handle2) = server2.remote_handle();
+    let (server1, _handle1) = server1.remote_handle();
+    let (server2, _handle2) = server2.remote_handle();
     wasm_bindgen_futures::spawn_local(server1);
     wasm_bindgen_futures::spawn_local(server2);
-    /* run test */
-    match join(client1.add(1, 2), client2.add(3, 4)).await {
-        (3, 7) => {}
-        _ => panic!("incorrect result"),
-    }
+    assert_eq!(join(client1.add(1, 2), client2.add(3, 4)).await, (3, 7));
 }

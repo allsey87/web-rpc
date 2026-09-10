@@ -1,12 +1,14 @@
-use futures_util::FutureExt;
+mod common;
+
 use wasm_bindgen_test::*;
 
 #[web_rpc::service]
 pub trait Calculator {
     fn add(&self, left: u32, right: u32) -> u32;
 }
-struct CalculatorServiceImpl;
-impl Calculator for CalculatorServiceImpl {
+
+struct CalculatorImpl;
+impl Calculator for CalculatorImpl {
     fn add(&self, left: u32, right: u32) -> u32 {
         left + right
     }
@@ -14,24 +16,7 @@ impl Calculator for CalculatorServiceImpl {
 
 #[wasm_bindgen_test]
 async fn unidirectional() {
-    console_error_panic_hook::set_once();
-    /* create channel */
-    let channel = web_sys::MessageChannel::new().unwrap();
-    let (server_interface, client_interface) = futures_util::future::join(
-        web_rpc::Interface::new(channel.port1()),
-        web_rpc::Interface::new(channel.port2()),
-    )
-    .await;
-    /* create and spawn server (shuts down when _server_handle is dropped) */
-    let (server, _server_handle) = web_rpc::Builder::new(server_interface)
-        .with_service::<CalculatorService<_>>(CalculatorServiceImpl)
-        .build()
-        .remote_handle();
-    wasm_bindgen_futures::spawn_local(server);
-    /* create client */
-    let client = web_rpc::Builder::new(client_interface)
-        .with_client::<CalculatorClient>()
-        .build();
-    /* run test */
+    let (client, _server) =
+        common::connect::<CalculatorService<_>, CalculatorClient>(CalculatorImpl).await;
     assert_eq!(client.add(41, 1).await, 42);
 }

@@ -5,6 +5,11 @@ jobs:
   test:
     name: cargo test
     runs-on: ubuntu-latest
+    # The end-to-end tests load generated modules from blob URLs and drive a real Worker,
+    # neither of which exists under node, so that target asks for a browser itself. The
+    # arguments Chrome needs in CI are in web-rpc/webdriver.json.
+    env:
+      CHROMEDRIVER: /usr/bin/chromedriver
     steps:
       - name: Clone repository
         uses: actions/checkout@v4
@@ -13,11 +18,20 @@ jobs:
         with:
           toolchain: stable
           target: wasm32-unknown-unknown
-          components: rustfmt
+          components: rustfmt, clippy, llvm-tools
           cache: false
       - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@main
-      - name: Install wasm-bindgen
-        run: cargo binstall --no-confirm wasm-bindgen-cli@0.2.106
+      - name: Install wasm-bindgen and cargo-binutils
+        run: cargo binstall --no-confirm wasm-bindgen-cli@0.2.106 cargo-binutils
+      # Builds the test binaries, extracts the Javascript endpoints from them with objcopy
+      # into web-rpc/tests/js/generated/, checks them with node, and diffs them against
+      # web-rpc/tests/js/expected/. The browser tests below load the extracted files.
+      - name: Extract and check the generated Javascript
+        run: web-rpc/tests/js/check.py
       - name: Run tests
         run: cargo test
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings

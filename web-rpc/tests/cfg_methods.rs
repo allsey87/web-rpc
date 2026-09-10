@@ -1,143 +1,95 @@
-#[cfg(feature = "extra")]
+//! A `#[cfg]` on a trait method reaches the request enum, the response enum, the client, the
+//! server and the description in lockstep. `cfg(any())` is always false and `cfg(all())`
+//! always true, so one build covers a stripped method and a kept one, and the method after
+//! the stripped one takes its index on the wire.
+
+#![allow(clippy::non_minimal_cfg)]
+
+mod common;
+
 use futures_core::Stream;
-use futures_util::FutureExt;
-#[cfg(feature = "extra")]
 use futures_util::StreamExt;
 use wasm_bindgen_test::*;
+use web_rpc::wrap::Transfer;
 
 #[web_rpc::service]
-pub trait Demo {
-    fn always_on(&self, x: u32) -> u32;
+pub trait Gated {
+    fn first(&self, value: u32) -> u32;
 
-    #[cfg(feature = "extra")]
-    fn extra(&self, s: &str) -> String;
+    #[cfg(any())]
+    fn stripped(&self, text: &str) -> String;
 
-    #[cfg(feature = "extra")]
-    fn extra_stream(&self, n: u32) -> impl Stream<Item = u32>;
+    #[cfg(all())]
+    fn kept(&self, text: &str) -> String;
+
+    #[cfg(any())]
+    fn stripped_stream(&self, count: u32) -> impl Stream<Item = u32>;
+
+    #[cfg(all())]
+    fn kept_stream(&self, count: u32) -> impl Stream<Item = u32>;
+
+    #[cfg(any())]
+    fn stripped_upload(&self, buffer: Transfer<js_sys::ArrayBuffer>) -> u32;
+
+    #[cfg(all())]
+    fn kept_upload(&self, buffer: Transfer<js_sys::ArrayBuffer>) -> u32;
+
+    fn last(&self, value: u32) -> u32;
 }
 
-struct DemoImpl;
-
-impl Demo for DemoImpl {
-    fn always_on(&self, x: u32) -> u32 {
-        x + 1
+struct GatedImpl;
+impl Gated for GatedImpl {
+    fn first(&self, value: u32) -> u32 {
+        value + 1
     }
-
-    #[cfg(feature = "extra")]
-    fn extra(&self, s: &str) -> String {
-        format!("got {s}")
+    #[cfg(any())]
+    fn stripped(&self, text: &str) -> String {
+        unreachable!()
     }
-
-    #[cfg(feature = "extra")]
-    fn extra_stream(&self, n: u32) -> impl Stream<Item = u32> {
-        let (tx, rx) = futures_channel::mpsc::unbounded();
-        for i in 0..n {
-            let _ = tx.unbounded_send(i);
-        }
-        rx
+    #[cfg(all())]
+    fn kept(&self, text: &str) -> String {
+        format!("got {text}")
     }
-}
-
-async fn build() -> (DemoClient, futures_util::future::RemoteHandle<()>) {
-    let channel = web_sys::MessageChannel::new().unwrap();
-    let (server_interface, client_interface) = futures_util::future::join(
-        web_rpc::Interface::new(channel.port1()),
-        web_rpc::Interface::new(channel.port2()),
-    )
-    .await;
-    let (server, handle) = web_rpc::Builder::new(server_interface)
-        .with_service::<DemoService<_>>(DemoImpl)
-        .build()
-        .remote_handle();
-    wasm_bindgen_futures::spawn_local(server);
-    let client = web_rpc::Builder::new(client_interface)
-        .with_client::<DemoClient>()
-        .build();
-    (client, handle)
-}
-
-#[wasm_bindgen_test]
-async fn always_on_method_works() {
-    console_error_panic_hook::set_once();
-    let (client, _handle) = build().await;
-    assert_eq!(client.always_on(41).await, 42);
-}
-
-#[cfg(feature = "extra")]
-#[wasm_bindgen_test]
-async fn gated_method_works_when_feature_on() {
-    console_error_panic_hook::set_once();
-    let (client, _handle) = build().await;
-    assert_eq!(client.extra("hi").await, "got hi");
-}
-
-#[cfg(feature = "extra")]
-#[wasm_bindgen_test]
-async fn gated_streaming_method_works_when_feature_on() {
-    console_error_panic_hook::set_once();
-    let (client, _handle) = build().await;
-    let items: Vec<u32> = client.extra_stream(3).collect().await;
-    assert_eq!(items, vec![0, 1, 2]);
-}
-
-// Method-level cfg combined with #[transfer].
-
-#[web_rpc::service]
-pub trait Uploader {
-    fn ping(&self) -> u32;
-
-    #[cfg(feature = "extra")]
-    #[transfer(buffer)]
-    fn upload(&self, buffer: js_sys::ArrayBuffer) -> u32;
-}
-
-struct UploaderImpl;
-
-impl Uploader for UploaderImpl {
-    fn ping(&self) -> u32 {
-        7
+    #[cfg(any())]
+    fn stripped_stream(&self, count: u32) -> impl Stream<Item = u32> {
+        futures_util::stream::empty()
     }
-
-    #[cfg(feature = "extra")]
-    fn upload(&self, buffer: js_sys::ArrayBuffer) -> u32 {
+    #[cfg(all())]
+    fn kept_stream(&self, count: u32) -> impl Stream<Item = u32> {
+        futures_util::stream::iter(0..count)
+    }
+    #[cfg(any())]
+    fn stripped_upload(&self, buffer: Transfer<js_sys::ArrayBuffer>) -> u32 {
+        unreachable!()
+    }
+    #[cfg(all())]
+    fn kept_upload(&self, buffer: Transfer<js_sys::ArrayBuffer>) -> u32 {
         buffer.byte_length()
     }
-}
-
-async fn build_uploader() -> (UploaderClient, futures_util::future::RemoteHandle<()>) {
-    let channel = web_sys::MessageChannel::new().unwrap();
-    let (server_interface, client_interface) = futures_util::future::join(
-        web_rpc::Interface::new(channel.port1()),
-        web_rpc::Interface::new(channel.port2()),
-    )
-    .await;
-    let (server, handle) = web_rpc::Builder::new(server_interface)
-        .with_service::<UploaderService<_>>(UploaderImpl)
-        .build()
-        .remote_handle();
-    wasm_bindgen_futures::spawn_local(server);
-    let client = web_rpc::Builder::new(client_interface)
-        .with_client::<UploaderClient>()
-        .build();
-    (client, handle)
+    fn last(&self, value: u32) -> u32 {
+        value + 2
+    }
 }
 
 #[wasm_bindgen_test]
-async fn uploader_ping_works() {
-    console_error_panic_hook::set_once();
-    let (client, _handle) = build_uploader().await;
-    assert_eq!(client.ping().await, 7);
-}
-
-#[cfg(feature = "extra")]
-#[wasm_bindgen_test]
-async fn gated_transfer_param_works() {
-    console_error_panic_hook::set_once();
-    let (client, _handle) = build_uploader().await;
+async fn methods_around_a_stripped_one_still_agree() {
+    let (client, _server) = common::connect::<GatedService<_>, GatedClient>(GatedImpl).await;
+    assert_eq!(client.first(41).await, 42);
+    assert_eq!(client.kept("hi").await, "got hi");
+    let items: Vec<u32> = client.kept_stream(3).collect().await;
+    assert_eq!(items, vec![0, 1, 2]);
     let buffer = js_sys::ArrayBuffer::new(16);
-    assert_eq!(buffer.byte_length(), 16);
-    assert_eq!(client.upload(buffer.clone()).await, 16);
-    // Detached on the sender after transfer.
+    assert_eq!(client.kept_upload(Transfer(buffer.clone())).await, 16);
     assert_eq!(buffer.byte_length(), 0);
+    assert_eq!(client.last(40).await, 42);
 }
 
+#[wasm_bindgen_test]
+fn the_description_skips_stripped_methods() {
+    let names: Vec<&str> = GATED_DESCRIPTION
+        .methods
+        .iter()
+        .flat_map(|group| group.iter().map(|method| method.name))
+        .collect();
+    assert_eq!(names, ["first", "kept", "keptStream", "keptUpload", "last"]);
+}

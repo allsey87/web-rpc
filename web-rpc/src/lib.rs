@@ -2,13 +2,15 @@
 //!
 //! This crate allows you to define a service as a trait and annotate it with
 //! [`#[web_rpc::service]`](macro@service). The macro then produces a `*Client`, a `*Service`,
-//! and a forwarding trait that you can implement on the server side.
+//! a forwarding trait that you can implement on the server side, and a compile-time
+//! [description](describe::Service) of the trait from which
+//! [`js::endpoint!`](macro@js::endpoint) can render a typed Javascript endpoint.
 //!
-//! Routing is inferred from each type: anything implementing
-//! [`AsRef<JsValue>`](https://docs.rs/wasm-bindgen/latest/wasm_bindgen/struct.JsValue.html) is
-//! posted through `postMessage` directly and everything that is serializable is first encoded
-//! via bincode. There is special support for `Option<T>` and `Result<T, E>` to allow Javascript
-//! types to be embedded within these types. This behaviour is recursive.
+//! Routing is explicit. A value wrapped in [`Post`](wrap::Post) or [`Transfer`](wrap::Transfer)
+//! crosses the channel as a Javascript value through `postMessage`; anything else is encoded
+//! with [postcard](https://docs.rs/postcard) and must implement
+//! [`postcard_schema::Schema`]. There is special support for `Option<T>` and `Result<T, E>`
+//! so that Javascript values can be embedded within them, and this behaviour is recursive.
 //!
 //! # Quickstart
 //! ```rust
@@ -22,7 +24,7 @@
 //! }
 //! ```
 //! Wire up over a `MessageChannel`, [`Worker`](https://docs.rs/web-sys/latest/web_sys/struct.Worker.html),
-//! or any [`MessagePort`](https://docs.rs/web-sys/latest/web_sys/struct.MessagePort.html). Each
+//! or any [`MessagePort`](https://docs.rs/web-sys/latest/web_sys/struct.MessagePort.html).
 //! Each call to [`Interface::new`] is async because temporary listeners need to detect when
 //! both ends are ready.
 //! ```rust,no_run
@@ -32,6 +34,8 @@
 //! # impl Calculator for Calc { fn add(&self, l: u32, r: u32) -> u32 { l + r } }
 //! # async fn run() {
 //! let channel = web_sys::MessageChannel::new().unwrap();
+//! channel.port1().start();
+//! channel.port2().start();
 //! let (server_iface, client_iface) = futures_util::future::join(
 //!     web_rpc::Interface::new(channel.port1()),
 //!     web_rpc::Interface::new(channel.port2()),
@@ -49,23 +53,44 @@
 //! # }
 //! ```
 //!
+//! # Transports are borrowed, never owned
+//! web-rpc uses the transport it is handed and never manages its lifecycle. Dropping a
+//! [`Port`](port::Port), an [`Interface`] or a client does not terminate a
+//! [`Worker`](web_sys::Worker): whoever created the worker terminates it. Likewise a
+//! [`MessagePort`](web_sys::MessagePort) is **not** started for you, on either the Rust or the
+//! Javascript side. Call [`start`](web_sys::MessagePort::start) on it before handing it over,
+//! as in the example above; an unstarted port delivers nothing to the listener that
+//! [`Interface::new`] installs, so the symptom is a handshake that spins forever rather than an
+//! error.
+//!
 //! # Routing
 //! ```rust
+//! use web_rpc::wrap::{Post, Transfer};
+//!
 //! #[web_rpc::service]
 //! pub trait Routing {
-//!     // Plain types that implement Serialize go through bincode.
+//!     // Plain types implementing `Serialize` and `Schema` go through postcard.
 //!     fn add(&self, l: u32, r: u32) -> u32;
-//!     // Anything `AsRef<JsValue>` is posted through the JS array.
-//!     fn echo(&self, s: js_sys::JsString) -> js_sys::JsString;
-//!     // `Option`/`Result` recurse: Ok(Some(_)) is posted, Ok(None) is one byte,
-//!     // Err carries a bincoded `String`.
-//!     fn lookup(&self, k: u32) -> Result<Option<js_sys::JsString>, String>;
+//!     // `Post<T>` crosses as a Javascript value, copied by structured clone.
+//!     fn echo(&self, s: Post<js_sys::JsString>) -> Post<js_sys::JsString>;
+//!     // `Transfer<T>` crosses as a Javascript value and is moved, not copied.
+//!     fn upload(&self, buffer: Transfer<js_sys::ArrayBuffer>) -> u32;
+//!     // `Option`/`Result` recurse: each variant routes independently.
+//!     fn lookup(&self, k: u32) -> Result<Option<Post<js_sys::JsString>>, String>;
 //!     // `&str` / `&[u8]` deserialize zero-copy on the server.
-//!     fn count(&self, data: &[u8]) -> usize;
-//!     // References to JS types are accepted too and are decoded via JsCast::dyn_ref.
-//!     fn len(&self, s: &js_sys::JsString) -> u32;
+//!     fn count(&self, data: &[u8]) -> u32;
 //! }
 //! ```
+//! A bare Javascript type in a signature is a compile error, because it implements neither
+//! [`serde::Serialize`] nor [`postcard_schema::Schema`]. Note that a typed array is not a
+//! transferable object: send `Transfer<ArrayBuffer>` and rebuild the view on the other side.
+//!
+//! Every type in a signature must implement [`postcard_schema::Schema`], which for your own
+//! payload types means `#[derive(Schema)]` alongside the serde derives. The trait description,
+//! and therefore the generated Javascript, is built from it. postcard-schema implements `Schema`
+//! for neither `usize` nor `isize`, since serde widens both to 64 bits, so use a fixed-width
+//! integer in a signature; and a foreign type with no upstream `Schema` impl needs a local
+//! mirror type.
 //!
 //! # Async, notifications, streaming
 //! ```rust
@@ -91,37 +116,7 @@
 //! produces. Dropping the receiver aborts the stream on the server, while
 //! [`close`](client::StreamReceiver::close) lets buffered items finish arriving instead.
 //! Streaming methods can also be `async` and the items they yield can be wrapper types like
-//! `Result<JsT, E>`.
-//!
-//! # Transfer
-//! Anything that should be transferred to the other side rather than copied with the structured
-//! clone algorithm can be specified inside a `#[transfer(...)]` attribute as a comma-separated
-//! list. The simplest case is to list the parameter that holds the transferable value, but if
-//! that value is wrapped or derived from a parameter, you can use a parameter-name expression
-//! (`name => expr`, evaluated with `name` in scope), a closure with a refutable pattern
-//! (`name => |pat| body`), or a match-block (`name => match { arm, ... }`). The same forms also
-//! work for the return value via `return`.
-//! ```rust
-//! # use wasm_bindgen::JsCast;
-//! #[web_rpc::service]
-//! pub trait Transfer {
-//!     // Bare param + derived expression + return closure.
-//!     #[transfer(
-//!         canvas,
-//!         data => data.buffer(),
-//!         return => |Ok(buf)| buf.buffer(),
-//!     )]
-//!     fn render(
-//!         &self,
-//!         canvas: web_sys::OffscreenCanvas,
-//!         data: js_sys::Uint8Array,
-//!     ) -> Result<js_sys::Uint8Array, String>;
-//!
-//!     // Match-block: useful when several variants need transferring.
-//!     #[transfer(return => match { Some(buf) => buf.buffer(), })]
-//!     fn maybe(&self) -> Option<js_sys::Uint8Array>;
-//! }
-//! ```
+//! `Result<Post<JsT>, E>`.
 //!
 //! # Conditional methods
 //! Methods can be gated with `#[cfg(...)]` or `#[cfg_attr(...)]`. The macro propagates these
@@ -130,11 +125,11 @@
 //! #[web_rpc::service]
 //! pub trait Conditional {
 //!     fn always_on(&self, x: u32) -> u32;
-//!     #[cfg(feature = "extra")]
+//!     #[cfg(feature = "admin")]
 //!     fn extra(&self, s: &str) -> String;
 //! }
 //! ```
-//! Bincode encodes enum variants by their positional discriminant, so the set of methods
+//! Postcard encodes enum variants by their positional discriminant, so the set of methods
 //! that survive cfg evaluation must match on both ends of a channel. If one side has a gated
 //! method enabled and the other does not, the wire format will silently desync.
 //!
@@ -160,6 +155,11 @@
 //!     .build();
 //! # }
 //! ```
+//!
+//! # Javascript endpoints
+//! [`js::endpoint!`](macro@js::endpoint) renders a Javascript class and a `.d.ts` for the other
+//! end of a connection, from the same traits, into two custom sections of the wasm binary. See
+//! the [`js`] module.
 
 use std::{
     cell::RefCell,
@@ -171,14 +171,12 @@ use std::{
 
 use futures_channel::mpsc;
 use futures_core::{future::LocalBoxFuture, Future};
-use futures_util::{FutureExt, StreamExt};
+use futures_util::{future::Shared, FutureExt, StreamExt};
 use gloo_events::EventListener;
-use js_sys::{ArrayBuffer, Uint8Array};
+use js_sys::{Array, ArrayBuffer, Uint8Array};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use wasm_bindgen::JsCast;
 
-#[doc(hidden)]
-pub use bincode;
 #[doc(hidden)]
 pub use futures_channel;
 #[doc(hidden)]
@@ -190,32 +188,88 @@ pub use gloo_events;
 #[doc(hidden)]
 pub use js_sys;
 #[doc(hidden)]
-pub use pin_utils;
+pub use postcard;
+#[doc(hidden)]
+pub use postcard_schema;
 #[doc(hidden)]
 pub use serde;
 #[doc(hidden)]
 pub use wasm_bindgen;
+#[doc(hidden)]
+pub use web_sys;
 
 pub use web_rpc_macro::service;
 
 pub mod client;
 #[doc(hidden)]
 pub mod codec;
+pub mod describe;
 pub mod interface;
+pub mod js;
 pub mod port;
 #[doc(hidden)]
 pub mod service;
+pub mod wrap;
 
 pub use interface::Interface;
+use port::Port;
 
+/// The first element of every message. The sequence number is allocated by whoever sends
+/// the request, and identifies a message only within the direction it travels.
 #[doc(hidden)]
 #[derive(Serialize, Deserialize)]
 pub enum MessageHeader {
-    Request(usize),
-    Abort(usize),
-    Response(usize),
-    StreamItem(usize),
-    StreamEnd(usize),
+    Request(u32),
+    Abort(u32),
+    Response(u32),
+    StreamItem(u32),
+    StreamEnd(u32),
+}
+
+/// The future that turns inbound messages into responses, stream items and requests. It is
+/// shared by every client and server on one interface and driven by whichever of them is
+/// polled, and it completes only when the listener that feeds it is dropped.
+#[doc(hidden)]
+pub type Dispatcher = Shared<LocalBoxFuture<'static, ()>>;
+
+fn to_buffer(bytes: &[u8]) -> ArrayBuffer {
+    Uint8Array::from(bytes).buffer()
+}
+
+/// Take the `ArrayBuffer` at the front of a message and copy it out.
+#[doc(hidden)]
+pub fn take_bytes(message: &Array) -> Vec<u8> {
+    let buffer = message
+        .shift()
+        .dyn_into::<ArrayBuffer>()
+        .expect("web_rpc: a message must start with an ArrayBuffer");
+    Uint8Array::new(&buffer).to_vec()
+}
+
+/// Post a message that is only a header.
+#[doc(hidden)]
+pub fn post_header(port: &Port, header: MessageHeader) {
+    let header = to_buffer(&postcard::to_allocvec(&header).unwrap());
+    let message = Array::of1(&header);
+    port.post_message(&message, &message).unwrap();
+}
+
+/// Post `[header, payload, ...post_args]`, transferring the buffers and `transfer_args`.
+#[doc(hidden)]
+pub fn post_message(
+    port: &Port,
+    header: MessageHeader,
+    payload: &impl Serialize,
+    post_args: &Array,
+    transfer_args: &Array,
+) {
+    let header = to_buffer(&postcard::to_allocvec(&header).unwrap());
+    let payload = to_buffer(&postcard::to_allocvec(payload).unwrap());
+    post_args.unshift(&payload);
+    post_args.unshift(&header);
+    transfer_args.unshift(&payload);
+    transfer_args.unshift(&header);
+    port.post_message(post_args, transfer_args).unwrap();
 }
 
 /// This struct allows one to configure the RPC interface prior to creating it.
@@ -232,7 +286,7 @@ impl Builder<(), ()> {
     pub fn new(interface: Interface) -> Self {
         Self {
             interface,
-            client: PhantomData::<()>,
+            client: PhantomData,
             service: (),
         }
     }
@@ -243,7 +297,7 @@ impl<C> Builder<C, ()> {
     /// that can be called from the other side of the channel. To use this method,
     /// you need to specify the type `S` which is the service type generated by the
     /// attribute macro [`macro@service`]. The implementation parameter is then an
-    /// instance of something that implements the trait to which to applied the
+    /// instance of something that implements the trait to which you applied the
     /// [`macro@service`] macro. For example, if you have a trait `Calculator` to
     /// which you have applied [`macro@service`], you would use this method as follows:
     /// ```rust,no_run
@@ -262,33 +316,26 @@ impl<C> Builder<C, ()> {
     /// # }
     /// ```
     pub fn with_service<S: service::Service>(self, implementation: impl Into<S>) -> Builder<C, S> {
-        let service = implementation.into();
-        let Builder {
-            interface, client, ..
-        } = self;
         Builder {
-            interface,
-            client,
-            service,
+            interface: self.interface,
+            client: self.client,
+            service: implementation.into(),
         }
     }
 }
 
 impl<S> Builder<(), S> {
     /// Configure the RPC interface with a client that allows you to execute RPCs on the
-    /// server. The builder will automatically instansiate the client for you, you just
+    /// server. The builder instantiates the client for you, you just
     /// need to provide the type which is generated via the [`macro@service`] attribute
     /// macro. For example, if you had a trait `Calculator` to which you applied the
     /// [`macro@service`] attribute macro, the macro would have generated a `CalculatorClient`
     /// struct which you can use as the `C` in this function.
     pub fn with_client<C: client::Client>(self) -> Builder<C, S> {
-        let Builder {
-            interface, service, ..
-        } = self;
         Builder {
-            interface,
-            client: PhantomData::<C>,
-            service,
+            interface: self.interface,
+            client: PhantomData,
+            service: self.service,
         }
     }
 }
@@ -310,242 +357,140 @@ impl Future for Server {
     }
 }
 
-impl<C> Builder<C, ()>
+/// The client half of an interface with no client: it receives nothing and is never handed
+/// out.
+struct NoClient;
+
+impl client::Client for NoClient {
+    type Response = ();
+}
+
+impl From<client::State<()>> for NoClient {
+    fn from(_: client::State<()>) -> Self {
+        NoClient
+    }
+}
+
+/// The service half of an interface with no service: its server is dropped unpolled.
+struct NoService;
+
+impl service::Service for NoService {
+    type Response = ();
+
+    async fn execute(
+        &self,
+        _: u32,
+        _: futures_channel::oneshot::Receiver<()>,
+        _: Vec<u8>,
+        _: Array,
+        _: mpsc::UnboundedSender<service::StreamMessage<()>>,
+    ) -> (u32, service::ExecuteResult<()>) {
+        unreachable!("web_rpc: a request reached an interface with no service")
+    }
+}
+
+/// Build both halves of an interface. Whichever half the caller did not ask for is built
+/// from its `No*` stand-in and dropped.
+fn assemble<C, S>(interface: Interface, service: S) -> (C, Server)
 where
-    C: client::Client + From<client::Configuration<C::Response>> + 'static,
-    <C as client::Client>::Response: DeserializeOwned,
+    C: client::Client + From<client::State<C::Response>> + 'static,
+    C::Response: DeserializeOwned,
+    S: service::Service + 'static,
+    S::Response: Serialize,
 {
-    /// Build function for client-only RPC interfaces.
-    pub fn build(self) -> C {
-        let Builder {
-            interface:
-                Interface {
-                    port,
-                    listener,
-                    mut messages_rx,
-                },
-            ..
-        } = self;
-        let client_callback_map: Rc<RefCell<client::CallbackMap<C::Response>>> = Default::default();
-        let client_callback_map_cloned = client_callback_map.clone();
-        let stream_callback_map: Rc<RefCell<client::StreamCallbackMap<C::Response>>> =
-            Default::default();
-        let stream_callback_map_cloned = stream_callback_map.clone();
-        let dispatcher = async move {
-            while let Some(array) = messages_rx.next().await {
-                let header_bytes =
-                    Uint8Array::new(&array.shift().dyn_into::<ArrayBuffer>().unwrap()).to_vec();
-                let header: MessageHeader = bincode::deserialize(&header_bytes).unwrap();
+    let Interface {
+        port,
+        listener,
+        mut messages_rx,
+    } = interface;
+    let callbacks: Rc<RefCell<client::CallbackMap<C::Response>>> = Default::default();
+    let stream_callbacks: Rc<RefCell<client::StreamCallbackMap<C::Response>>> = Default::default();
+    let (requests_tx, requests_rx) = mpsc::unbounded();
+    let (aborts_tx, aborts_rx) = mpsc::unbounded();
+    let dispatcher: Dispatcher = {
+        let callbacks = callbacks.clone();
+        let stream_callbacks = stream_callbacks.clone();
+        async move {
+            while let Some(message) = messages_rx.next().await {
+                let header: MessageHeader = postcard::from_bytes(&take_bytes(&message)).unwrap();
                 match header {
-                    MessageHeader::Response(seq_id) => {
-                        let payload_bytes =
-                            Uint8Array::new(&array.shift().dyn_into::<ArrayBuffer>().unwrap())
-                                .to_vec();
-                        let response: C::Response = bincode::deserialize(&payload_bytes).unwrap();
-                        if let Some(callback_tx) =
-                            client_callback_map_cloned.borrow_mut().remove(&seq_id)
-                        {
-                            let _ = callback_tx.send((response, array));
+                    MessageHeader::Request(sequence) => {
+                        let payload = take_bytes(&message);
+                        requests_tx
+                            .unbounded_send((sequence, payload, message))
+                            .expect("web_rpc: a request arrived but the server has been dropped");
+                    }
+                    MessageHeader::Abort(sequence) => {
+                        let _ = aborts_tx.unbounded_send(sequence);
+                    }
+                    MessageHeader::Response(sequence) => {
+                        let response = postcard::from_bytes(&take_bytes(&message)).unwrap();
+                        if let Some(callback) = callbacks.borrow_mut().remove(&sequence) {
+                            let _ = callback.send((response, message));
                         }
                     }
-                    MessageHeader::StreamItem(seq_id) => {
-                        let payload_bytes =
-                            Uint8Array::new(&array.shift().dyn_into::<ArrayBuffer>().unwrap())
-                                .to_vec();
-                        let response: C::Response = bincode::deserialize(&payload_bytes).unwrap();
-                        if let Some(tx) = stream_callback_map_cloned.borrow().get(&seq_id) {
-                            let _ = tx.unbounded_send((response, array));
+                    MessageHeader::StreamItem(sequence) => {
+                        let item = postcard::from_bytes(&take_bytes(&message)).unwrap();
+                        if let Some(items) = stream_callbacks.borrow().get(&sequence) {
+                            let _ = items.unbounded_send((item, message));
                         }
                     }
-                    MessageHeader::StreamEnd(seq_id) => {
-                        stream_callback_map_cloned.borrow_mut().remove(&seq_id);
+                    MessageHeader::StreamEnd(sequence) => {
+                        stream_callbacks.borrow_mut().remove(&sequence);
                     }
-                    _ => panic!("client received a server message"),
                 }
             }
         }
         .boxed_local()
-        .shared();
-        let port_cloned = port.clone();
-        let abort_sender = move |seq_id: usize| {
-            let header = MessageHeader::Abort(seq_id);
-            let header_bytes = bincode::serialize(&header).unwrap();
-            let buffer = js_sys::Uint8Array::from(&header_bytes[..]).buffer();
-            let post_args = js_sys::Array::of1(&buffer);
-            let transfer_args = js_sys::Array::of1(&buffer);
-            port_cloned
-                .post_message(&post_args, &transfer_args)
-                .unwrap();
-        };
-        C::from((
-            client_callback_map,
-            stream_callback_map,
-            port,
-            Rc::new(listener),
-            dispatcher,
-            Rc::new(abort_sender),
-        ))
+        .shared()
+    };
+    let listener = Rc::new(listener);
+    let client = C::from(client::State {
+        callbacks,
+        stream_callbacks,
+        port: port.clone(),
+        listener: listener.clone(),
+        dispatcher: dispatcher.clone(),
+        sequence: Default::default(),
+    });
+    let server = Server {
+        _listener: listener,
+        task: service::task::<S>(service, port, dispatcher, requests_rx, aborts_rx).boxed_local(),
+    };
+    (client, server)
+}
+
+impl<C> Builder<C, ()>
+where
+    C: client::Client + From<client::State<C::Response>> + 'static,
+    C::Response: DeserializeOwned,
+{
+    /// Build function for client-only RPC interfaces.
+    pub fn build(self) -> C {
+        assemble::<C, NoService>(self.interface, NoService).0
     }
 }
 
 impl<S> Builder<(), S>
 where
     S: service::Service + 'static,
-    <S as service::Service>::Response: Serialize,
+    S::Response: Serialize,
 {
     /// Build function for server-only RPC interfaces.
     pub fn build(self) -> Server {
-        let Builder {
-            service,
-            interface:
-                Interface {
-                    port,
-                    listener,
-                    mut messages_rx,
-                },
-            ..
-        } = self;
-        let (server_requests_tx, server_requests_rx) = mpsc::unbounded();
-        let (abort_requests_tx, abort_requests_rx) = mpsc::unbounded();
-        let dispatcher = async move {
-            while let Some(array) = messages_rx.next().await {
-                let header_bytes =
-                    Uint8Array::new(&array.shift().dyn_into::<ArrayBuffer>().unwrap()).to_vec();
-                let header: MessageHeader = bincode::deserialize(&header_bytes).unwrap();
-                match header {
-                    MessageHeader::Request(seq_id) => {
-                        let payload =
-                            Uint8Array::new(&array.shift().dyn_into::<ArrayBuffer>().unwrap())
-                                .to_vec();
-                        server_requests_tx
-                            .unbounded_send((seq_id, payload, array))
-                            .unwrap();
-                    }
-                    MessageHeader::Abort(seq_id) => {
-                        abort_requests_tx.unbounded_send(seq_id).unwrap();
-                    }
-                    _ => panic!("server received a client message"),
-                }
-            }
-        }
-        .boxed_local()
-        .shared();
-        Server {
-            _listener: Rc::new(listener),
-            task: service::task::<S>(
-                service,
-                port,
-                dispatcher,
-                server_requests_rx,
-                abort_requests_rx,
-            )
-            .boxed_local(),
-        }
+        assemble::<NoClient, S>(self.interface, self.service).1
     }
 }
 
 impl<C, S> Builder<C, S>
 where
-    C: client::Client + From<client::Configuration<C::Response>> + 'static,
+    C: client::Client + From<client::State<C::Response>> + 'static,
+    C::Response: DeserializeOwned,
     S: service::Service + 'static,
-    <S as service::Service>::Response: Serialize,
-    <C as client::Client>::Response: DeserializeOwned,
+    S::Response: Serialize,
 {
     /// Build function for client-server RPC interfaces.
     pub fn build(self) -> (C, Server) {
-        let Builder {
-            service: server,
-            interface:
-                Interface {
-                    port,
-                    listener,
-                    mut messages_rx,
-                },
-            ..
-        } = self;
-        let client_callback_map: Rc<RefCell<client::CallbackMap<C::Response>>> = Default::default();
-        let stream_callback_map: Rc<RefCell<client::StreamCallbackMap<C::Response>>> =
-            Default::default();
-        let (server_requests_tx, server_requests_rx) = mpsc::unbounded();
-        let (abort_requests_tx, abort_requests_rx) = mpsc::unbounded();
-        let client_callback_map_cloned = client_callback_map.clone();
-        let stream_callback_map_cloned = stream_callback_map.clone();
-        let dispatcher = async move {
-            while let Some(array) = messages_rx.next().await {
-                let header_bytes =
-                    Uint8Array::new(&array.shift().dyn_into::<ArrayBuffer>().unwrap()).to_vec();
-                let header: MessageHeader = bincode::deserialize(&header_bytes).unwrap();
-                match header {
-                    MessageHeader::Response(seq_id) => {
-                        let payload_bytes =
-                            Uint8Array::new(&array.shift().dyn_into::<ArrayBuffer>().unwrap())
-                                .to_vec();
-                        let response: C::Response = bincode::deserialize(&payload_bytes).unwrap();
-                        if let Some(callback_tx) =
-                            client_callback_map_cloned.borrow_mut().remove(&seq_id)
-                        {
-                            let _ = callback_tx.send((response, array));
-                        }
-                    }
-                    MessageHeader::StreamItem(seq_id) => {
-                        let payload_bytes =
-                            Uint8Array::new(&array.shift().dyn_into::<ArrayBuffer>().unwrap())
-                                .to_vec();
-                        let response: C::Response = bincode::deserialize(&payload_bytes).unwrap();
-                        if let Some(tx) = stream_callback_map_cloned.borrow().get(&seq_id) {
-                            let _ = tx.unbounded_send((response, array));
-                        }
-                    }
-                    MessageHeader::StreamEnd(seq_id) => {
-                        stream_callback_map_cloned.borrow_mut().remove(&seq_id);
-                    }
-                    MessageHeader::Request(seq_id) => {
-                        let payload =
-                            Uint8Array::new(&array.shift().dyn_into::<ArrayBuffer>().unwrap())
-                                .to_vec();
-                        server_requests_tx
-                            .unbounded_send((seq_id, payload, array))
-                            .unwrap();
-                    }
-                    MessageHeader::Abort(seq_id) => {
-                        abort_requests_tx.unbounded_send(seq_id).unwrap();
-                    }
-                }
-            }
-        }
-        .boxed_local()
-        .shared();
-        let port_cloned = port.clone();
-        let abort_sender = move |seq_id: usize| {
-            let header = MessageHeader::Abort(seq_id);
-            let header_bytes = bincode::serialize(&header).unwrap();
-            let buffer = js_sys::Uint8Array::from(&header_bytes[..]).buffer();
-            let post_args = js_sys::Array::of1(&buffer);
-            let transfer_args = js_sys::Array::of1(&buffer);
-            port_cloned
-                .post_message(&post_args, &transfer_args)
-                .unwrap();
-        };
-        let listener = Rc::new(listener);
-        let client = C::from((
-            client_callback_map,
-            stream_callback_map,
-            port.clone(),
-            listener.clone(),
-            dispatcher.clone(),
-            Rc::new(abort_sender),
-        ));
-        let server = Server {
-            _listener: listener,
-            task: service::task::<S>(
-                server,
-                port,
-                dispatcher,
-                server_requests_rx,
-                abort_requests_rx,
-            )
-            .boxed_local(),
-        };
-        (client, server)
+        assemble::<C, S>(self.interface, self.service)
     }
 }

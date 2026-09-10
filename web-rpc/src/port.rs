@@ -1,22 +1,23 @@
-use std::rc::Rc;
 use wasm_bindgen::JsValue;
 
-/// Port abstracts over the different Javascript types that support sending and
-/// receiving messages. We need to abstract over these types since there is no
-/// trait available to describe this interface. Moreover, some of these interfaces
-/// have slightly different semantics, e.g., we need to call [web_sys::MessagePort::start]
-/// for the [web_sys::MessagePort]. The inner variants are wrapped in an [Rc] so that
-/// we can force a worker to terminate when we drop the last instance. Unfortunately,
-/// the browser does not seem to reliably terminate workers during garbage collection.
+/// The Javascript types that send and receive messages.
+///
+/// A port is a transport that web-rpc is handed, never one that it owns: each variant is a
+/// cheap handle to a Javascript object, and dropping the last clone does nothing.
+///
+/// - Nothing here terminates a [`web_sys::Worker`]. Whoever created the worker terminates it.
+/// - Nothing here calls [`web_sys::MessagePort::start`]. **A `MessagePort` must be started by
+///   its owner before it is handed over**, otherwise it delivers nothing to the listener that
+///   [`crate::Interface::new`] installs and the handshake never completes.
 #[derive(Clone)]
 pub enum Port {
-    Worker(Rc<web_sys::Worker>),
-    DedicatedWorkerGlobalScope(Rc<web_sys::DedicatedWorkerGlobalScope>),
-    MessagePort(Rc<web_sys::MessagePort>),
+    Worker(web_sys::Worker),
+    DedicatedWorkerGlobalScope(web_sys::DedicatedWorkerGlobalScope),
+    MessagePort(web_sys::MessagePort),
 }
 
 impl Port {
-    /// Dispatch `post_message` for the different implementations
+    /// Post a message with a transfer list.
     pub fn post_message(&self, message: &JsValue, transfer: &JsValue) -> Result<(), JsValue> {
         match self {
             Port::Worker(worker) => worker.post_message_with_transfer(message, transfer),
@@ -24,12 +25,6 @@ impl Port {
                 scope.post_message_with_transfer(message, transfer)
             }
             Port::MessagePort(port) => port.post_message_with_transferable(message, transfer),
-        }
-    }
-
-    pub(crate) fn start(&self) {
-        if let Port::MessagePort(port) = self {
-            port.start()
         }
     }
 
@@ -44,28 +39,18 @@ impl Port {
 
 impl From<web_sys::Worker> for Port {
     fn from(worker: web_sys::Worker) -> Self {
-        Port::Worker(worker.into())
+        Port::Worker(worker)
     }
 }
 
 impl From<web_sys::DedicatedWorkerGlobalScope> for Port {
     fn from(scope: web_sys::DedicatedWorkerGlobalScope) -> Self {
-        Port::DedicatedWorkerGlobalScope(scope.into())
+        Port::DedicatedWorkerGlobalScope(scope)
     }
 }
 
 impl From<web_sys::MessagePort> for Port {
     fn from(port: web_sys::MessagePort) -> Self {
-        Port::MessagePort(port.into())
-    }
-}
-
-impl Drop for Port {
-    fn drop(&mut self) {
-        if let Port::Worker(worker) = self {
-            if Rc::strong_count(worker) == 1 {
-                worker.terminate()
-            }
-        }
+        Port::MessagePort(port)
     }
 }

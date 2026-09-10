@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote, quote_spanned, ToTokens};
@@ -11,8 +9,7 @@ use syn::{
     parse_macro_input, parse_quote,
     punctuated::Punctuated,
     spanned::Spanned,
-    token::Comma,
-    Attribute, FnArg, Ident, Lifetime, Pat, PatType, ReturnType, Token, Type, Visibility,
+    Attribute, FnArg, Ident, Lifetime, Pat, PatType, Path, ReturnType, Token, Type, Visibility,
 };
 
 macro_rules! extend_errors {
@@ -24,195 +21,278 @@ macro_rules! extend_errors {
     };
 }
 
+// ---------------------------------------------------------------------------
+// Signature types
+// ---------------------------------------------------------------------------
+
 /// If `ty` is `impl Stream<Item = T>`, returns Some(T).
 fn stream_item_type(ty: &Type) -> Option<&Type> {
-    if let Type::ImplTrait(impl_trait) = ty {
-        for bound in &impl_trait.bounds {
-            if let syn::TypeParamBound::Trait(trait_bound) = bound {
-                let last_segment = trait_bound.path.segments.last()?;
-                if last_segment.ident == "Stream" {
-                    if let syn::PathArguments::AngleBracketed(args) = &last_segment.arguments {
-                        for arg in &args.args {
-                            if let syn::GenericArgument::Binding(binding) = arg {
-                                if binding.ident == "Item" {
-                                    return Some(&binding.ty);
-                                }
-                            }
-                        }
-                    }
+    let Type::ImplTrait(impl_trait) = ty else {
+        return None;
+    };
+    for bound in &impl_trait.bounds {
+        let syn::TypeParamBound::Trait(trait_bound) = bound else {
+            continue;
+        };
+        let last_segment = trait_bound.path.segments.last()?;
+        if last_segment.ident != "Stream" {
+            continue;
+        }
+        let syn::PathArguments::AngleBracketed(arguments) = &last_segment.arguments else {
+            continue;
+        };
+        for argument in &arguments.args {
+            if let syn::GenericArgument::AssocType(associated) = argument {
+                if associated.ident == "Item" {
+                    return Some(&associated.ty);
                 }
             }
         }
     }
     None
+}
+
+/// The type arguments of `ty` if its last path segment is `wrapper<..>`.
+fn type_arguments<'a>(ty: &'a Type, wrapper: &str) -> Option<Vec<&'a Type>> {
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    let last_segment = type_path.path.segments.last()?;
+    if last_segment.ident != wrapper {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(arguments) = &last_segment.arguments else {
+        return None;
+    };
+    arguments
+        .args
+        .iter()
+        .map(|argument| match argument {
+            syn::GenericArgument::Type(ty) => Some(ty),
+            _ => None,
+        })
+        .collect()
 }
 
 /// If `ty` is `Option<T>`, returns Some(T).
 fn option_inner_type(ty: &Type) -> Option<&Type> {
-    if let Type::Path(type_path) = ty {
-        let last_seg = type_path.path.segments.last()?;
-        if last_seg.ident == "Option" {
-            if let syn::PathArguments::AngleBracketed(args) = &last_seg.arguments {
-                if args.args.len() == 1 {
-                    if let syn::GenericArgument::Type(inner) = &args.args[0] {
-                        return Some(inner);
-                    }
-                }
-            }
-        }
+    match type_arguments(ty, "Option")?.as_slice() {
+        [inner] => Some(inner),
+        _ => None,
     }
-    None
 }
 
 /// If `ty` is `Result<T, E>`, returns Some((T, E)).
 fn result_inner_types(ty: &Type) -> Option<(&Type, &Type)> {
-    if let Type::Path(type_path) = ty {
-        let last_seg = type_path.path.segments.last()?;
-        if last_seg.ident == "Result" {
-            if let syn::PathArguments::AngleBracketed(args) = &last_seg.arguments {
-                if args.args.len() == 2 {
-                    if let (syn::GenericArgument::Type(ok_ty), syn::GenericArgument::Type(err_ty)) =
-                        (&args.args[0], &args.args[1])
-                    {
-                        return Some((ok_ty, err_ty));
-                    }
-                }
-            }
+    match type_arguments(ty, "Result")?.as_slice() {
+        [ok, err] => Some((ok, err)),
+        _ => None,
+    }
+}
+
+/// If `ty` is `Post<T>` or `Transfer<T>`, returns the inner type and whether it is transferred.
+fn js_inner_type(ty: &Type) -> Option<(&Type, bool)> {
+    for (wrapper, transfer) in [("Post", false), ("Transfer", true)] {
+        if let Some([inner]) = type_arguments(ty, wrapper).as_deref() {
+            return Some((inner, transfer));
         }
     }
     None
 }
 
-/// True if `ty` is `&str` or `&[u8]` — the only reference shapes we route through
-/// the existing serde-borrowing path (zero-copy, with an `'a` lifetime injected
-/// into the request enum). Any other reference shape goes through the JS path.
+/// True if `ty` is `&str` or `&[u8]`, the two reference shapes that keep serde's zero-copy
+/// borrowing path, with an `'a` lifetime injected into the request enum.
 fn is_borrowed_serde_ref(ty: &Type) -> bool {
-    if let Type::Reference(r) = ty {
-        match &*r.elem {
-            Type::Path(p) if p.path.is_ident("str") => return true,
-            Type::Slice(s) => {
-                if let Type::Path(p) = &*s.elem {
-                    if p.path.is_ident("u8") {
-                        return true;
-                    }
-                }
-            }
-            _ => {}
-        }
+    let Type::Reference(reference) = ty else {
+        return false;
+    };
+    match &*reference.elem {
+        Type::Path(path) => path.path.is_ident("str"),
+        Type::Slice(slice) => matches!(&*slice.elem, Type::Path(path) if path.path.is_ident("u8")),
+        _ => false,
     }
-    false
-}
-
-/// True if `ty` is a reference to a presumed JS type (anything other than
-/// `&str`/`&[u8]`). The receiver side decodes these via `JsCast::dyn_ref`.
-fn is_js_ref(ty: &Type) -> bool {
-    matches!(ty, Type::Reference(_)) && !is_borrowed_serde_ref(ty)
 }
 
 /// True if `attr` is a cfg-style attribute (`#[cfg(...)]` or `#[cfg_attr(...)]`).
 /// These are propagated onto every generated artifact derived from a method so
 /// that rustc strips them in lockstep after macro expansion.
 fn is_cfg_attr(attr: &Attribute) -> bool {
-    attr.path.is_ident("cfg") || attr.path.is_ident("cfg_attr")
+    attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr")
 }
 
-/// Recursively emit code that encodes a value of type `ty` into a `WireArg`,
-/// pushing JS values onto `post` as a side-effect.
+/// The `#[cfg(...)]` predicates on an item, which decide whether it survives compilation.
+/// `#[cfg_attr(...)]` rewrites attributes rather than presence and is not included.
+fn cfg_predicates(attrs: &[Attribute]) -> Vec<TokenStream2> {
+    attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("cfg"))
+        .filter_map(|attr| attr.parse_args::<TokenStream2>().ok())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Routing
+// ---------------------------------------------------------------------------
+
+/// Recursively emit code that encodes a value of type `ty` into a `WireArg`, pushing Javascript
+/// values onto `post_args` and, for `Transfer`, onto `transfer_args` as a side effect.
 ///
-/// Caller supplies `value` as a token-tree expression (typically an ident binding).
-/// The emitted code matches structure on `Option`/`Result` and recurses; bare
-/// leaves dispatch through the autoref encoder traits.
-///
-/// Reference-to-JS types should be handled by the caller before invoking this
-/// helper — they cannot be encoded as nested elements (no `Decoder<&T>` impl on
-/// the receiver side).
-fn emit_encode(ty: &Type, value: TokenStream2, post: &TokenStream2) -> TokenStream2 {
-    // Match against `&#value` so the original binding remains accessible to any
-    // transfer-side code emitted alongside the encoder. Match ergonomics binds
-    // `__inner` as a reference inside each arm.
+/// The emitted code matches on `&value`, so the caller's binding stays usable, and match
+/// ergonomics binds `__inner` as a reference inside each arm.
+fn emit_encode(
+    ty: &Type,
+    value: TokenStream2,
+    post_args: &TokenStream2,
+    transfer_args: &TokenStream2,
+) -> TokenStream2 {
     if let Some(inner) = option_inner_type(ty) {
-        let inner_enc = emit_encode(inner, quote!(__inner), post);
+        let inner_encode = emit_encode(inner, quote!(__inner), post_args, transfer_args);
         quote_spanned! {ty.span()=>
             match &#value {
                 ::core::option::Option::Some(__inner) =>
-                    web_rpc::codec::WireArg::Some(std::boxed::Box::new(#inner_enc)),
+                    web_rpc::codec::WireArg::Some(::std::boxed::Box::new(#inner_encode)),
                 ::core::option::Option::None =>
                     web_rpc::codec::WireArg::None,
             }
         }
     } else if let Some((ok, err)) = result_inner_types(ty) {
-        let ok_enc = emit_encode(ok, quote!(__inner), post);
-        let err_enc = emit_encode(err, quote!(__inner), post);
+        let ok_encode = emit_encode(ok, quote!(__inner), post_args, transfer_args);
+        let err_encode = emit_encode(err, quote!(__inner), post_args, transfer_args);
         quote_spanned! {ty.span()=>
             match &#value {
                 ::core::result::Result::Ok(__inner) =>
-                    web_rpc::codec::WireArg::Ok(std::boxed::Box::new(#ok_enc)),
+                    web_rpc::codec::WireArg::Ok(::std::boxed::Box::new(#ok_encode)),
                 ::core::result::Result::Err(__inner) =>
-                    web_rpc::codec::WireArg::Err(std::boxed::Box::new(#err_enc)),
+                    web_rpc::codec::WireArg::Err(::std::boxed::Box::new(#err_encode)),
+            }
+        }
+    } else if let Some((_, transfer)) = js_inner_type(ty) {
+        let push_transfer = transfer.then(|| {
+            quote! { (#transfer_args).push(web_rpc::wrap::js_value(&#value.0)); }
+        });
+        quote_spanned! {ty.span()=>
+            {
+                (#post_args).push(web_rpc::wrap::js_value(&#value.0));
+                #push_transfer
+                web_rpc::codec::WireArg::Js
             }
         }
     } else {
         quote_spanned! {ty.span()=>
-            {
-                #[allow(unused_imports)]
-                use web_rpc::codec::{
-                    __RpcJsEncode as _,
-                    __RpcSerialEncode as _,
-                };
-                (&#value).__rpc_encode(#post)
+            web_rpc::codec::WireArg::Bytes(
+                web_rpc::postcard::to_allocvec(&#value).unwrap()
+            )
+        }
+    }
+}
+
+/// Recursively emit code that decodes a `WireArg` of type `ty` into a Rust value, shifting
+/// Javascript values off `js_values` as needed.
+fn emit_decode(ty: &Type, wire: TokenStream2, js_values: &TokenStream2) -> TokenStream2 {
+    if let Some(inner) = option_inner_type(ty) {
+        let inner_decode = emit_decode(inner, quote!(*__inner), js_values);
+        quote_spanned! {ty.span()=>
+            match #wire {
+                web_rpc::codec::WireArg::Some(__inner) =>
+                    ::core::option::Option::Some(#inner_decode),
+                web_rpc::codec::WireArg::None =>
+                    ::core::option::Option::None,
+                _ => panic!("web_rpc: wire/type mismatch, expected Some or None"),
+            }
+        }
+    } else if let Some((ok, err)) = result_inner_types(ty) {
+        let ok_decode = emit_decode(ok, quote!(*__inner), js_values);
+        let err_decode = emit_decode(err, quote!(*__inner), js_values);
+        quote_spanned! {ty.span()=>
+            match #wire {
+                web_rpc::codec::WireArg::Ok(__inner) =>
+                    ::core::result::Result::Ok(#ok_decode),
+                web_rpc::codec::WireArg::Err(__inner) =>
+                    ::core::result::Result::Err(#err_decode),
+                _ => panic!("web_rpc: wire/type mismatch, expected Ok or Err"),
+            }
+        }
+    } else if let Some((inner, _)) = js_inner_type(ty) {
+        quote_spanned! {ty.span()=>
+            match #wire {
+                web_rpc::codec::WireArg::Js => <#ty>::new(
+                    web_rpc::wasm_bindgen::JsCast::dyn_into::<#inner>((#js_values).shift()).unwrap()
+                ),
+                _ => panic!("web_rpc: wire/type mismatch, expected a Javascript value"),
+            }
+        }
+    } else {
+        quote_spanned! {ty.span()=>
+            match #wire {
+                web_rpc::codec::WireArg::Bytes(__bytes) =>
+                    web_rpc::postcard::from_bytes::<#ty>(&__bytes).unwrap(),
+                _ => panic!("web_rpc: wire/type mismatch, expected postcard bytes"),
             }
         }
     }
 }
 
-/// Recursively emit code that decodes a `WireArg` of type `ty` into a Rust value,
-/// shifting JS values off `post` as needed.
+/// Emit the `&'static Desc` describing how a value of type `ty` crosses the channel.
 ///
-/// Caller supplies `wire` as a token-tree expression evaluating to a `WireArg`.
-/// Reference-to-JS types should be handled by the caller — see `emit_encode`.
-fn emit_decode(ty: &Type, wire: TokenStream2, post: &TokenStream2) -> TokenStream2 {
+/// The `Schema` and `JsName` bounds are expressed at the signature type's own span, so a
+/// missing derive is reported at the argument or return type rather than inside the expansion.
+fn emit_desc(ty: &Type) -> TokenStream2 {
     if let Some(inner) = option_inner_type(ty) {
-        let inner_dec = emit_decode(inner, quote!(*__inner), post);
-        quote_spanned! {ty.span()=>
-            match #wire {
-                web_rpc::codec::WireArg::Some(__inner) =>
-                    ::core::option::Option::Some(#inner_dec),
-                web_rpc::codec::WireArg::None =>
-                    ::core::option::Option::None,
-                _ => panic!("web_rpc: wire/type mismatch — expected Some or None"),
+        let inner_desc = emit_desc(inner);
+        quote_spanned!(ty.span()=> &web_rpc::describe::Desc::Option(#inner_desc))
+    } else if let Some((ok, err)) = result_inner_types(ty) {
+        let ok_desc = emit_desc(ok);
+        let err_desc = emit_desc(err);
+        quote_spanned!(ty.span()=> &web_rpc::describe::Desc::Result(#ok_desc, #err_desc))
+    } else if let Some((inner, transfer)) = js_inner_type(ty) {
+        quote_spanned! {inner.span()=>
+            &web_rpc::describe::Desc::Js {
+                name: <#inner as web_rpc::describe::JsName>::NAME,
+                transfer: #transfer,
             }
         }
-    } else if let Some((ok, err)) = result_inner_types(ty) {
-        let ok_dec = emit_decode(ok, quote!(*__inner), post);
-        let err_dec = emit_decode(err, quote!(*__inner), post);
+    } else if is_borrowed_serde_ref(ty) {
+        // postcard-schema implements `Schema` for `[T]` but not for `str`; the borrowed forms
+        // encode identically to their owned counterparts.
+        let schema_ty: Type = match ty {
+            Type::Reference(reference) => match &*reference.elem {
+                Type::Path(path) if path.path.is_ident("str") => {
+                    parse_quote!(::std::string::String)
+                }
+                other => other.clone(),
+            },
+            other => other.clone(),
+        };
         quote_spanned! {ty.span()=>
-            match #wire {
-                web_rpc::codec::WireArg::Ok(__inner) =>
-                    ::core::result::Result::Ok(#ok_dec),
-                web_rpc::codec::WireArg::Err(__inner) =>
-                    ::core::result::Result::Err(#err_dec),
-                _ => panic!("web_rpc: wire/type mismatch — expected Ok or Err"),
-            }
+            &web_rpc::describe::Desc::Inline(
+                <#schema_ty as web_rpc::postcard_schema::Schema>::SCHEMA
+            )
         }
     } else {
         quote_spanned! {ty.span()=>
-            {
-                #[allow(unused_imports)]
-                use web_rpc::codec::{
-                    __RpcJsDecode as _,
-                    __RpcSerialDecode as _,
-                };
-                (&web_rpc::codec::Decoder::<#ty>::default()).__rpc_decode(#wire, #post)
-            }
+            &web_rpc::describe::Desc::Postcard(
+                <#ty as web_rpc::postcard_schema::Schema>::SCHEMA
+            )
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The parsed trait
+// ---------------------------------------------------------------------------
 
 struct Service {
     attrs: Vec<Attribute>,
     vis: Visibility,
     ident: Ident,
-    rpcs: Vec<RpcMethod>,
+    methods: Vec<RpcMethod>,
+}
+
+/// What a method sends back.
+enum MethodOutput {
+    Notify,
+    Value(Type),
+    Stream(Type),
 }
 
 struct RpcMethod {
@@ -221,120 +301,126 @@ struct RpcMethod {
     receiver: syn::Receiver,
     ident: Ident,
     args: Vec<PatType>,
-    transfer: Vec<TransferClause>,
-    output: ReturnType,
+    output: MethodOutput,
 }
 
-/// One entry inside a `#[transfer(...)]` attribute.
-#[allow(dead_code)]
-enum TransferClause {
-    /// `name` — push the parameter itself, unconditionally.
-    BareParam(Ident),
-    /// `data => data.buffer()` — push the expression's result, unconditionally.
-    ParamExpr { name: Ident, body: syn::Expr },
-    /// `data => |Some(d)| d.buffer()` (closure) or
-    /// `data => match { Some(d) => d.buffer(), ... }` (match-block).
-    /// Each `Gate` becomes one `if let pat = &name { __transfer.push(body) }`.
-    ParamGated { name: Ident, gates: Vec<Gate> },
-    /// `return` — push the response value itself, unconditionally.
-    BareReturn,
-    /// `return => |Ok(o)| o.buffer()` or `return => match { ... }`.
-    ReturnGated { gates: Vec<Gate> },
+impl RpcMethod {
+    /// The identifiers of the arguments. Patterns are rejected at parse time, so every
+    /// argument has one.
+    fn argument_idents(&self) -> impl Iterator<Item = &Ident> {
+        self.args.iter().map(|argument| match &*argument.pat {
+            Pat::Ident(pattern) => &pattern.ident,
+            _ => unreachable!("argument patterns are rejected while parsing"),
+        })
+    }
+
+    /// The `#[cfg]` and `#[cfg_attr]` attributes, propagated to everything derived from
+    /// this method.
+    fn cfg_attrs(&self) -> impl Iterator<Item = &Attribute> {
+        self.attrs.iter().filter(|attr| is_cfg_attr(attr))
+    }
+
+    /// The name of this method's variant in the request and response enums.
+    fn variant_ident(&self) -> Ident {
+        Ident::new(
+            &snake_to_camel(&self.ident.unraw().to_string()),
+            self.ident.span(),
+        )
+    }
+
+    /// The name of this method on the Javascript side.
+    fn wire_name(&self) -> String {
+        to_lower_camel(&self.ident.unraw().to_string())
+    }
+
+    /// The return type as written in the generated trait and forwarding impls.
+    fn return_tokens(&self) -> TokenStream2 {
+        match &self.output {
+            MethodOutput::Notify => quote!(),
+            MethodOutput::Value(ty) => quote!(-> #ty),
+            MethodOutput::Stream(item) => {
+                quote!(-> impl web_rpc::futures_core::Stream<Item = #item>)
+            }
+        }
+    }
 }
 
-#[allow(dead_code)]
-struct Gate {
-    pat: syn::Pat,
-    body: syn::Expr,
-}
+// ---------------------------------------------------------------------------
+// Code generation
+// ---------------------------------------------------------------------------
 
 struct ServiceGenerator<'a> {
     trait_ident: &'a Ident,
-    service_ident: &'a Ident,
-    client_ident: &'a Ident,
-    request_ident: &'a Ident,
-    response_ident: &'a Ident,
+    service_ident: Ident,
+    client_ident: Ident,
+    request_ident: Ident,
+    response_ident: Ident,
+    description_ident: Ident,
     vis: &'a Visibility,
     attrs: &'a [Attribute],
-    rpcs: &'a [RpcMethod],
-    camel_case_idents: &'a [Ident],
-    has_streaming_methods: bool,
+    methods: &'a [RpcMethod],
 }
 
-impl<'a> ServiceGenerator<'a> {
+impl ServiceGenerator<'_> {
     fn enum_request(&self) -> TokenStream2 {
-        let &Self {
+        let Self {
             vis,
             request_ident,
-            camel_case_idents,
-            rpcs,
+            methods,
             ..
         } = self;
-        let variants = rpcs.iter().zip(camel_case_idents.iter()).map(
-            |(RpcMethod { attrs, args, .. }, camel_case_ident)| {
-                let cfg_attrs = attrs.iter().filter(|a| is_cfg_attr(a));
-                let fields = args.iter().map(|arg| {
-                    let pat = &arg.pat;
-                    if is_borrowed_serde_ref(&arg.ty) {
-                        // `&str` / `&[u8]` — keep zero-copy serde borrowing path.
-                        let mut type_ref = match &*arg.ty {
-                            Type::Reference(r) => r.clone(),
-                            _ => unreachable!("is_borrowed_serde_ref guarantees a reference"),
-                        };
-                        type_ref.lifetime =
-                            Some(Lifetime::new("'a", type_ref.and_token.span()));
-                        quote_spanned! {arg.ty.span()=> #pat: #type_ref }
-                    } else {
-                        // Everything else (including `&JsT`) uses the universal
-                        // recursive WireArg representation.
-                        quote_spanned! {arg.ty.span()=>
-                            #pat: web_rpc::codec::WireArg
-                        }
-                    }
-                });
-                quote! {
-                    #(#cfg_attrs)*
-                    #camel_case_ident { #( #fields ),* }
+        let variants = methods.iter().map(|method| {
+            let cfg_attrs = method.cfg_attrs();
+            let variant_ident = method.variant_ident();
+            let fields = method.args.iter().map(|argument| {
+                let pat = &argument.pat;
+                if is_borrowed_serde_ref(&argument.ty) {
+                    // `&str` / `&[u8]` keep the zero-copy serde borrowing path.
+                    let Type::Reference(reference) = &*argument.ty else {
+                        unreachable!("is_borrowed_serde_ref guarantees a reference")
+                    };
+                    let mut reference = reference.clone();
+                    reference.lifetime = Some(Lifetime::new("'a", reference.and_token.span()));
+                    quote_spanned! {argument.ty.span()=> #pat: #reference }
+                } else {
+                    quote_spanned! {argument.ty.span()=> #pat: web_rpc::codec::WireArg }
                 }
-            },
-        );
-        // `<'a>` is always emitted, with a hidden variant that uses it via
-        // `PhantomData`. This keeps the enum well-formed regardless of which
-        // methods rustc strips via cfg-evaluation after macro expansion: a
-        // service whose only borrowing methods get cfg'd out would otherwise
-        // hit E0392. The macro never constructs this variant on the wire; the
-        // server's match arm panics if it ever appears.
+            });
+            quote! {
+                #(#cfg_attrs)*
+                #variant_ident { #( #fields ),* }
+            }
+        });
+        // The hidden variant uses `'a` so that the enum stays well-formed when every borrowing
+        // method is stripped by cfg. It is never constructed; the server's match arm panics on
+        // it.
         quote! {
             #[derive(web_rpc::serde::Serialize, web_rpc::serde::Deserialize)]
             #vis enum #request_ident<'a> {
                 #( #variants, )*
                 #[doc(hidden)]
-                __WebRpcPhantom(std::marker::PhantomData<&'a ()>),
+                __WebRpcPhantom(::std::marker::PhantomData<&'a ()>),
             }
         }
     }
 
     fn enum_response(&self) -> TokenStream2 {
-        let &Self {
+        let Self {
             vis,
             response_ident,
-            camel_case_idents,
-            rpcs,
+            methods,
             ..
         } = self;
-        let variants = rpcs.iter().zip(camel_case_idents.iter()).map(
-            |(RpcMethod { attrs, .. }, camel_case_ident)| {
-                let cfg_attrs = attrs.iter().filter(|a| is_cfg_attr(a));
-                // Every method's response variant carries a single uniform
-                // `WireArg`. Notification methods (no return) still get a
-                // variant — the macro fills it with a placeholder that the
-                // client never reads.
-                quote! {
-                    #(#cfg_attrs)*
-                    #camel_case_ident ( web_rpc::codec::WireArg )
-                }
-            },
-        );
+        // Every method gets a variant so that variant indices match the request enum. A
+        // notification's variant is never constructed.
+        let variants = methods.iter().map(|method| {
+            let cfg_attrs = method.cfg_attrs();
+            let variant_ident = method.variant_ident();
+            quote! {
+                #(#cfg_attrs)*
+                #variant_ident ( web_rpc::codec::WireArg )
+            }
+        });
         quote! {
             #[derive(web_rpc::serde::Serialize, web_rpc::serde::Deserialize)]
             #vis enum #response_ident {
@@ -343,361 +429,259 @@ impl<'a> ServiceGenerator<'a> {
         }
     }
 
-    fn trait_service(&self) -> TokenStream2 {
-        let &Self {
+    /// The compile-time description of the trait, from which `js::endpoint!` renders
+    /// Javascript and Typescript.
+    fn const_description(&self) -> TokenStream2 {
+        let Self {
+            vis,
             attrs,
-            rpcs,
+            trait_ident,
+            description_ident,
+            methods,
+            ..
+        } = self;
+
+        let method_const_idents = (0..methods.len())
+            .map(|index| format_ident!("__WEB_RPC_{}_M{}", screaming_snake(trait_ident), index))
+            .collect::<Vec<_>>();
+
+        let method_consts =
+            methods
+                .iter()
+                .zip(&method_const_idents)
+                .map(|(method, const_ident)| {
+                    let args = method.args.iter().zip(method.argument_idents()).map(
+                        |(argument, ident)| {
+                            let name = to_lower_camel(&ident.unraw().to_string());
+                            let desc = emit_desc(&argument.ty);
+                            quote! { web_rpc::describe::Arg { name: #name, desc: #desc } }
+                        },
+                    );
+                    let ret = match &method.output {
+                        MethodOutput::Notify => quote!(web_rpc::describe::Return::Notify),
+                        MethodOutput::Value(ty) => {
+                            let desc = emit_desc(ty);
+                            quote!(web_rpc::describe::Return::Value(#desc))
+                        }
+                        MethodOutput::Stream(item) => {
+                            let desc = emit_desc(item);
+                            quote!(web_rpc::describe::Return::Stream(#desc))
+                        }
+                    };
+                    let wire_name = method.wire_name();
+                    let predicates = cfg_predicates(&method.attrs);
+                    let (enabled, disabled) = if predicates.is_empty() {
+                        (quote!(), quote!(#[cfg(any())]))
+                    } else {
+                        (
+                            quote!(#[cfg(all(#( #predicates ),*))]),
+                            quote!(#[cfg(not(all(#( #predicates ),*)))]),
+                        )
+                    };
+                    quote! {
+                        #enabled
+                        #[doc(hidden)]
+                        const #const_ident: &'static [web_rpc::describe::Method] =
+                            &[web_rpc::describe::Method {
+                                name: #wire_name,
+                                args: &[ #( #args ),* ],
+                                ret: #ret,
+                            }];
+                        #disabled
+                        #[doc(hidden)]
+                        const #const_ident: &'static [web_rpc::describe::Method] = &[];
+                    }
+                });
+
+        let trait_name = trait_ident.to_string();
+        let trait_cfgs = attrs
+            .iter()
+            .filter(|attr| is_cfg_attr(attr))
+            .collect::<Vec<_>>();
+        quote! {
+            #( #method_consts )*
+            #( #trait_cfgs )*
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals)]
+            #vis const #description_ident: &'static web_rpc::describe::Service =
+                &web_rpc::describe::Service {
+                    name: #trait_name,
+                    methods: &[ #( #method_const_idents ),* ],
+                };
+        }
+    }
+
+    fn trait_service(&self) -> TokenStream2 {
+        let Self {
+            attrs,
+            methods,
             vis,
             trait_ident,
             ..
         } = self;
 
-        let unit_type: &Type = &parse_quote!(());
-        let rpc_fns = rpcs.iter().map(
-            |RpcMethod {
-                 attrs,
-                 args,
-                 receiver,
-                 ident,
-                 is_async,
-                 output,
-                 ..
-             }| {
-                if let ReturnType::Type(_, ref ty) = output {
-                    if let Some(item_ty) = stream_item_type(ty) {
-                        return quote_spanned! {ident.span()=>
-                            #( #attrs )*
-                            #is_async fn #ident(#receiver, #( #args ),*) -> impl web_rpc::futures_core::Stream<Item = #item_ty>;
-                        };
-                    }
-                }
-                let output = match output {
-                    ReturnType::Type(_, ref ty) => ty,
-                    ReturnType::Default => unit_type,
-                };
+        let declarations = methods.iter().map(|method| {
+            let RpcMethod {
+                attrs,
+                args,
+                receiver,
+                ident,
+                is_async,
+                ..
+            } = method;
+            let output = method.return_tokens();
+            quote_spanned! {ident.span()=>
+                #( #attrs )*
+                #is_async fn #ident(#receiver, #( #args ),*) #output;
+            }
+        });
+
+        let forwards = methods
+            .iter()
+            .map(|method| {
+                let RpcMethod {
+                    attrs,
+                    args,
+                    receiver,
+                    ident,
+                    is_async,
+                    ..
+                } = method;
+                let output = method.return_tokens();
+                let do_await = is_async.map(|token| quote_spanned!(token.span=> .await));
+                let argument_idents = method.argument_idents();
                 quote_spanned! {ident.span()=>
                     #( #attrs )*
-                    #is_async fn #ident(#receiver, #( #args ),*) -> #output;
-                }
-            },
-        );
-
-        let forward_fns = rpcs
-            .iter()
-            .map(
-                |RpcMethod {
-                     attrs,
-                     args,
-                     receiver,
-                     ident,
-                     is_async,
-                     output,
-                     ..
-                 }| {
-                    {
-                        let output = if let ReturnType::Type(_, ref ty) = output {
-                            if let Some(item_ty) = stream_item_type(ty) {
-                                quote! { impl web_rpc::futures_core::Stream<Item = #item_ty> }
-                            } else {
-                                let ty: &Type = ty;
-                                quote! { #ty }
-                            }
-                        } else {
-                            let ty = unit_type;
-                            quote! { #ty }
-                        };
-                        let do_await = match is_async {
-                            Some(token) => quote_spanned!(token.span=> .await),
-                            None => quote!(),
-                        };
-                        let forward_args = args.iter().filter_map(|arg| match &*arg.pat {
-                            Pat::Ident(ident) => Some(&ident.ident),
-                            _ => None,
-                        });
-                        quote_spanned! {ident.span()=>
-                            #( #attrs )*
-                            #is_async fn #ident(#receiver, #( #args ),*) -> #output {
-                                T::#ident(self, #( #forward_args ),*)#do_await
-                            }
-                        }
+                    #is_async fn #ident(#receiver, #( #args ),*) #output {
+                        T::#ident(self, #( #argument_idents ),*)#do_await
                     }
-                },
-            )
+                }
+            })
             .collect::<Vec<_>>();
 
         quote! {
             #( #attrs )*
             #[allow(async_fn_in_trait)]
             #vis trait #trait_ident {
-                #( #rpc_fns )*
+                #( #declarations )*
             }
 
-            impl<T> #trait_ident for std::sync::Arc<T> where T: #trait_ident {
-                #( #forward_fns )*
+            impl<T> #trait_ident for ::std::sync::Arc<T> where T: #trait_ident {
+                #( #forwards )*
             }
-            impl<T> #trait_ident for std::boxed::Box<T> where T: #trait_ident {
-                #( #forward_fns )*
+            impl<T> #trait_ident for ::std::boxed::Box<T> where T: #trait_ident {
+                #( #forwards )*
             }
-            impl<T> #trait_ident for std::rc::Rc<T> where T: #trait_ident {
-                #( #forward_fns )*
+            impl<T> #trait_ident for ::std::rc::Rc<T> where T: #trait_ident {
+                #( #forwards )*
             }
         }
     }
 
     fn struct_client(&self) -> TokenStream2 {
-        let &Self {
+        let Self {
             vis,
             client_ident,
             request_ident,
             response_ident,
-            camel_case_idents,
-            rpcs,
-            has_streaming_methods,
+            methods,
             ..
         } = self;
 
-        let rpc_fns = rpcs
-            .iter()
-            .zip(camel_case_idents.iter())
-            .map(|(RpcMethod { attrs, args, transfer, ident, output, .. }, camel_case_ident)| {
-                // 1. Per-arg encoding: borrowed `&str`/`&[u8]` pass through inline;
-                // everything else routes through the autoref-dispatched `__rpc_encode`.
-                let mut arg_encodings = Vec::<TokenStream2>::new();
-                let mut request_struct_fields = Vec::<TokenStream2>::new();
-                for arg in args {
-                    let id = match &*arg.pat {
-                        Pat::Ident(p) => &p.ident,
-                        _ => continue,
-                    };
-                    if is_borrowed_serde_ref(&arg.ty) {
-                        request_struct_fields.push(quote! { #id });
-                    } else {
-                        let wire_ident = format_ident!("__wire_{}", id);
-                        let post = quote!(&__post);
-                        let enc = emit_encode(&arg.ty, quote!(#id), &post);
-                        arg_encodings.push(quote! { let #wire_ident = #enc; });
-                        request_struct_fields.push(quote! { #id: #wire_ident });
-                    }
-                }
+        let rpc_fns = methods.iter().map(|method| {
+            let RpcMethod {
+                attrs, args, ident, ..
+            } = method;
+            let variant_ident = method.variant_ident();
 
-                // 2. Per-method transfer pushes (param-side only; return-side
-                // clauses are handled in struct_server).
-                let transfer_pushes = transfer.iter().filter_map(|c| match c {
-                    TransferClause::BareParam(name) => Some(quote! {
-                        __transfer.push(#name.as_ref());
-                    }),
-                    TransferClause::ParamExpr { name, body } => Some(quote_spanned! {body.span()=>
-                        {
-                            let _ = &#name; // ensure name is referenced
-                            __transfer.push((#body).as_ref());
-                        }
-                    }),
-                    TransferClause::ParamGated { name, gates } => {
-                        let arms = gates.iter().map(|g| {
-                            let pat = &g.pat;
-                            let body = &g.body;
-                            quote_spanned! {body.span()=>
-                                if let #pat = &#name {
-                                    __transfer.push((#body).as_ref());
-                                }
-                            }
-                        });
-                        Some(quote! { #( #arms )* })
-                    }
-                    TransferClause::BareReturn | TransferClause::ReturnGated { .. } => None,
-                });
-
-                let send_request = quote! {
-                    let __seq_id = self.seq_id.replace_with(|seq_id| seq_id.wrapping_add(1));
-                    let __post = web_rpc::js_sys::Array::new();
-                    let __transfer = web_rpc::js_sys::Array::new();
-                    #( #arg_encodings )*
-                    let __request = #request_ident::#camel_case_ident {
-                        #( #request_struct_fields ),*
-                    };
-                    let __header = web_rpc::MessageHeader::Request(__seq_id);
-                    let __header_bytes = web_rpc::bincode::serialize(&__header).unwrap();
-                    let __header_buffer = web_rpc::js_sys::Uint8Array::from(&__header_bytes[..]).buffer();
-                    let __payload_bytes = web_rpc::bincode::serialize(&__request).unwrap();
-                    let __payload_buffer = web_rpc::js_sys::Uint8Array::from(&__payload_bytes[..]).buffer();
-                    // Prepend [header, payload] in front of the encoded JS values.
-                    __post.unshift(&__payload_buffer);
-                    __post.unshift(&__header_buffer);
-                    __transfer.push(__header_buffer.as_ref());
-                    __transfer.push(__payload_buffer.as_ref());
-                    #( #transfer_pushes )*
-                    self.port.post_message(&__post, &__transfer).unwrap();
-                };
-
-                let is_streaming = matches!(
-                    output,
-                    ReturnType::Type(_, ref ty) if stream_item_type(ty).is_some()
-                );
-
-                if is_streaming {
-                    let item_ty = match output {
-                        ReturnType::Type(_, ref ty) => stream_item_type(ty).unwrap(),
-                        _ => unreachable!(),
-                    };
-                    let dec = emit_decode(item_ty, quote!(__wire), &quote!(&__post_array));
-
-                    let unpack_stream_item = quote! {
-                        |(__response, __post_array): (#response_ident, web_rpc::js_sys::Array)| {
-                            let #response_ident::#camel_case_ident(__wire) = __response else {
-                                panic!("web_rpc: received incorrect response variant")
-                            };
-                            #dec
-                        }
-                    };
-
-                    quote! {
-                        #( #attrs )*
-                        #vis fn #ident(
-                            &self,
-                            #( #args ),*
-                        ) -> web_rpc::client::StreamReceiver<#item_ty> {
-                            #send_request
-                            let (__item_tx, __item_rx) = web_rpc::futures_channel::mpsc::unbounded();
-                            self.stream_callback_map.borrow_mut().insert(__seq_id, __item_tx);
-                            let __mapped_rx = web_rpc::futures_util::StreamExt::map(
-                                __item_rx,
-                                #unpack_stream_item
-                            );
-                            let __abort_sender = self.abort_sender.clone();
-                            let __stream_callback_map = self.stream_callback_map.clone();
-                            let __dispatcher = self.dispatcher.clone();
-                            web_rpc::client::StreamReceiver::new(
-                                __mapped_rx,
-                                __dispatcher,
-                                std::boxed::Box::new(move || {
-                                    __stream_callback_map.borrow_mut().remove(&__seq_id);
-                                    (__abort_sender)(__seq_id);
-                                }),
-                            )
-                        }
-                    }
+            // Borrowed `&str`/`&[u8]` pass through inline; everything else becomes a
+            // `WireArg`, pushing onto the post and transfer arrays as it goes.
+            let mut encodings = Vec::new();
+            let mut request_fields = Vec::new();
+            for (argument, argument_ident) in args.iter().zip(method.argument_idents()) {
+                if is_borrowed_serde_ref(&argument.ty) {
+                    request_fields.push(quote! { #argument_ident });
                 } else {
-                    let return_type = match output {
-                        ReturnType::Type(_, ref ty) => quote! {
-                            web_rpc::client::RequestFuture<#ty>
-                        },
-                        _ => quote!(()),
-                    };
-                    let maybe_register_callback = match output {
-                        ReturnType::Type(_, _) => quote! {
-                            let (__response_tx, __response_rx) =
-                                web_rpc::futures_channel::oneshot::channel();
-                            self.callback_map.borrow_mut().insert(__seq_id, __response_tx);
-                        },
-                        _ => Default::default(),
-                    };
+                    let wire_ident = format_ident!("__wire_{}", argument_ident);
+                    let encode = emit_encode(
+                        &argument.ty,
+                        quote!(#argument_ident),
+                        &quote!(&__post_args),
+                        &quote!(&__transfer_args),
+                    );
+                    encodings.push(quote! { let #wire_ident = #encode; });
+                    request_fields.push(quote! { #argument_ident: #wire_ident });
+                }
+            }
 
-                    let maybe_unpack_and_return_future = match output {
-                        ReturnType::Type(_, ref ret_ty) => {
-                            let dec = emit_decode(ret_ty, quote!(__wire), &quote!(&__post_array));
-                            quote! {
-                                let __response_future = web_rpc::futures_util::FutureExt::map(
-                                    __response_rx,
-                                    |response| {
-                                        let (__serialize_response, __post_array) = response.unwrap();
-                                        let #response_ident::#camel_case_ident(__wire) = __serialize_response else {
-                                            panic!("web_rpc: received incorrect response variant")
-                                        };
-                                        #dec
-                                    }
-                                );
-                                let __abort_sender = self.abort_sender.clone();
-                                let __dispatcher = self.dispatcher.clone();
-                                web_rpc::client::RequestFuture::new(
-                                    __response_future,
-                                    __dispatcher,
-                                    std::boxed::Box::new(move || (__abort_sender)(__seq_id)))
-                            }
-                        }
-                        _ => Default::default(),
-                    };
+            let send = quote! {
+                let __post_args = web_rpc::js_sys::Array::new();
+                let __transfer_args = web_rpc::js_sys::Array::new();
+                #( #encodings )*
+                let __request = #request_ident::#variant_ident { #( #request_fields ),* };
+                let __sequence = self.state.send(&__request, &__post_args, &__transfer_args);
+            };
 
-                    quote! {
-                        #( #attrs )*
-                        #vis fn #ident(
-                            &self,
-                            #( #args ),*
-                        ) -> #return_type {
-                            #send_request
-                            #maybe_register_callback
-                            #maybe_unpack_and_return_future
-                        }
+            let unpack = |ty: &Type| {
+                let decode = emit_decode(ty, quote!(__wire), &quote!(&__js_values));
+                quote! {
+                    |__response: #response_ident, __js_values: web_rpc::js_sys::Array| {
+                        let #response_ident::#variant_ident(__wire) = __response else {
+                            panic!("web_rpc: received a response for another method")
+                        };
+                        #decode
                     }
                 }
-            });
+            };
 
-        let stream_callback_map_field = if has_streaming_methods {
-            // `#[allow(dead_code)]` covers the case where every streaming method
-            // is stripped via cfg — the field is still bound by the
-            // `From<Configuration>` impl but no surviving method reads it.
+            let (return_type, body) = match &method.output {
+                MethodOutput::Notify => (quote!(()), quote! { #send }),
+                MethodOutput::Value(ty) => {
+                    let unpack = unpack(ty);
+                    (
+                        quote!(web_rpc::client::RequestFuture<#ty>),
+                        quote! {
+                            #send
+                            self.state.request(__sequence, #unpack)
+                        },
+                    )
+                }
+                MethodOutput::Stream(item) => {
+                    let unpack = unpack(item);
+                    (
+                        quote!(web_rpc::client::StreamReceiver<#item>),
+                        quote! {
+                            #send
+                            self.state.stream(__sequence, #unpack)
+                        },
+                    )
+                }
+            };
+
             quote! {
-                #[allow(dead_code)]
-                stream_callback_map: std::rc::Rc<
-                    std::cell::RefCell<
-                        web_rpc::client::StreamCallbackMap<#response_ident>
-                    >
-                >,
+                #( #attrs )*
+                #vis fn #ident(&self, #( #args ),*) -> #return_type {
+                    #body
+                }
             }
-        } else {
-            quote!()
-        };
-
-        let stream_callback_map_pat = if has_streaming_methods {
-            quote! { stream_callback_map, }
-        } else {
-            quote! { _, }
-        };
-
-        let stream_callback_map_init = if has_streaming_methods {
-            quote! { stream_callback_map, }
-        } else {
-            quote! {}
-        };
+        });
 
         quote! {
-            #[derive(core::clone::Clone)]
+            #[derive(::core::clone::Clone)]
             #vis struct #client_ident {
-                callback_map: std::rc::Rc<
-                    std::cell::RefCell<
-                        web_rpc::client::CallbackMap<#response_ident>
-                    >
-                >,
-                #stream_callback_map_field
-                port: web_rpc::port::Port,
-                listener: std::rc::Rc<web_rpc::gloo_events::EventListener>,
-                dispatcher: web_rpc::futures_util::future::Shared<
-                    web_rpc::futures_core::future::LocalBoxFuture<'static, ()>
-                >,
-                abort_sender: std::rc::Rc<dyn std::ops::Fn(usize)>,
-                seq_id: std::rc::Rc<std::cell::RefCell<usize>>
+                state: web_rpc::client::State<#response_ident>,
             }
-            impl std::fmt::Debug for #client_ident {
-                fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    formatter.debug_struct(std::stringify!(#client_ident))
-                        .finish()
+            impl ::std::fmt::Debug for #client_ident {
+                fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                    formatter.debug_struct(::std::stringify!(#client_ident)).finish()
                 }
             }
             impl web_rpc::client::Client for #client_ident {
                 type Response = #response_ident;
             }
-            impl From<web_rpc::client::Configuration<#response_ident>>
-                for #client_ident {
-                fn from((callback_map, #stream_callback_map_pat port, listener, dispatcher, abort_sender):
-                    web_rpc::client::Configuration<#response_ident>) -> Self {
-                    Self {
-                        callback_map,
-                        #stream_callback_map_init
-                        port,
-                        listener,
-                        dispatcher,
-                        abort_sender,
-                        seq_id: std::default::Default::default()
-                    }
+            impl ::std::convert::From<web_rpc::client::State<#response_ident>> for #client_ident {
+                fn from(state: web_rpc::client::State<#response_ident>) -> Self {
+                    Self { state }
                 }
             }
             impl #client_ident {
@@ -707,287 +691,191 @@ impl<'a> ServiceGenerator<'a> {
     }
 
     fn struct_server(&self) -> TokenStream2 {
-        let &Self {
+        let Self {
             vis,
             trait_ident,
             service_ident,
             request_ident,
             response_ident,
-            camel_case_idents,
-            rpcs,
+            methods,
             ..
         } = self;
 
-        let request_type = quote! { #request_ident<'_> };
+        let handlers = methods.iter().map(|method| {
+            let RpcMethod {
+                is_async,
+                ident,
+                args,
+                ..
+            } = method;
+            let cfg_attrs = method.cfg_attrs();
+            let variant_ident = method.variant_ident();
 
-        let handlers = rpcs.iter()
-            .zip(camel_case_idents.iter())
-            .map(|(RpcMethod { is_async, ident, args, transfer, output, attrs, .. }, camel_case_ident)| {
-                let cfg_attrs: Vec<_> = attrs.iter().filter(|a| is_cfg_attr(a)).collect();
-                // 1. Destructure pattern for the request enum variant.
-                // Borrowed args use their own ident; non-borrowed args bind to __wire_<id>.
-                let destructure_fields: Vec<_> = args.iter()
-                    .filter_map(|arg| {
-                        let id = match &*arg.pat {
-                            Pat::Ident(p) => &p.ident,
-                            _ => return None,
-                        };
-                        Some(if is_borrowed_serde_ref(&arg.ty) {
-                            quote! { #id }
-                        } else {
-                            let wire_ident = format_ident!("__wire_{}", id);
-                            quote! { #id: #wire_ident }
-                        })
-                    })
-                    .collect();
+            // Destructure the request variant. Borrowed arguments bind to their own ident;
+            // everything else binds to `__wire_<ident>` and is decoded below.
+            let mut destructure_fields = Vec::new();
+            let mut decodings = Vec::new();
+            for (argument, argument_ident) in args.iter().zip(method.argument_idents()) {
+                if is_borrowed_serde_ref(&argument.ty) {
+                    destructure_fields.push(quote! { #argument_ident });
+                } else {
+                    let wire_ident = format_ident!("__wire_{}", argument_ident);
+                    let decode =
+                        emit_decode(&argument.ty, quote!(#wire_ident), &quote!(&__js_args));
+                    destructure_fields.push(quote! { #argument_ident: #wire_ident });
+                    decodings.push(quote! { let #argument_ident = #decode; });
+                }
+            }
+            let argument_idents = method.argument_idents().collect::<Vec<_>>();
+            let call = quote! { self.implementation.#ident(#( #argument_idents ),*) };
 
-                // 2. Per-arg decoding statements.
-                let arg_decodes: Vec<_> = args.iter()
-                    .filter_map(|arg| {
-                        let id = match &*arg.pat {
-                            Pat::Ident(p) => &p.ident,
-                            _ => return None,
-                        };
-                        if is_borrowed_serde_ref(&arg.ty) {
-                            // Already bound by destructuring.
-                            None
-                        } else if is_js_ref(&arg.ty) {
-                            // `&T` where T: JsCast — no `Decoder<&T>` impl, so we
-                            // shift from the post-array and bind via dyn_ref locally.
-                            let inner_ty = match &*arg.ty {
-                                Type::Reference(r) => &*r.elem,
-                                _ => unreachable!(),
-                            };
-                            let tmp_ident = format_ident!("__tmp_{}", id);
-                            let wire_ident = format_ident!("__wire_{}", id);
-                            let arg_ty = &arg.ty;
-                            Some(quote! {
-                                let #tmp_ident = match #wire_ident {
-                                    web_rpc::codec::WireArg::Js => __js_args.shift(),
-                                    _ => panic!("web_rpc: expected Js wire variant for reference arg"),
-                                };
-                                let #id: #arg_ty = web_rpc::wasm_bindgen::JsCast::dyn_ref::<#inner_ty>(&#tmp_ident)
-                                    .unwrap();
-                            })
-                        } else {
-                            let wire_ident = format_ident!("__wire_{}", id);
-                            let dec = emit_decode(&arg.ty, quote!(#wire_ident), &quote!(&__js_args));
-                            Some(quote! { let #id = #dec; })
-                        }
-                    })
-                    .collect();
-
-                let call_args: Vec<_> = args.iter().filter_map(|arg| match &*arg.pat {
-                    Pat::Ident(ident) => Some(&ident.ident),
-                    _ => None,
-                }).collect();
-
-                // Return-side transfer clauses (BareReturn / ReturnGated).
-                // The scrutinee is `__response` for non-streaming and `__item` for streaming.
-                let make_return_transfer = |scrutinee_ident: &Ident| -> TokenStream2 {
-                    let pushes = transfer.iter().filter_map(|c| match c {
-                        TransferClause::BareReturn => Some(quote! {
-                            __transfer.push(#scrutinee_ident.as_ref());
-                        }),
-                        TransferClause::ReturnGated { gates } => {
-                            let arms = gates.iter().map(|g| {
-                                let pat = &g.pat;
-                                let body = &g.body;
-                                quote_spanned! {body.span()=>
-                                    if let #pat = &#scrutinee_ident {
-                                        __transfer.push((#body).as_ref());
-                                    }
-                                }
-                            });
-                            Some(quote! { #( #arms )* })
-                        }
-                        _ => None,
-                    });
-                    quote! { #( #pushes )* }
-                };
-
-                let is_streaming = matches!(
-                    output,
-                    ReturnType::Type(_, ref ty) if stream_item_type(ty).is_some()
+            let encode_outgoing = |ty: &Type, value: TokenStream2| {
+                let encode = emit_encode(
+                    ty,
+                    value,
+                    &quote!(&__post_args),
+                    &quote!(&__transfer_args),
                 );
+                quote! {
+                    let __post_args = web_rpc::js_sys::Array::new();
+                    let __transfer_args = web_rpc::js_sys::Array::new();
+                    let __wire = #encode;
+                    (#response_ident::#variant_ident(__wire), __post_args, __transfer_args)
+                }
+            };
 
-                if is_streaming {
-                    let item_ty = match output {
-                        ReturnType::Type(_, ref ty) => stream_item_type(ty).unwrap(),
-                        _ => unreachable!(),
-                    };
-                    let item_enc = emit_encode(item_ty, quote!(__item), &quote!(&__post));
-                    let item_ident = Ident::new("__item", proc_macro2::Span::call_site());
-                    let return_transfer = make_return_transfer(&item_ident);
-
-                    let wrap_item = quote! {
-                        let __post = web_rpc::js_sys::Array::new();
-                        let __transfer = web_rpc::js_sys::Array::new();
-                        let __wire_item = #item_enc;
-                        #return_transfer
-                        let __response = #response_ident::#camel_case_ident(__wire_item);
-                    };
-
-                    let fwd_body = quote! {
-                        let __stream_tx_clone = __stream_tx.clone();
-                        web_rpc::pin_utils::pin_mut!(__user_rx);
-                        let __fwd = async move {
-                            while let Some(__item) = web_rpc::futures_util::StreamExt::next(&mut __user_rx).await {
-                                #wrap_item
-                                if __stream_tx_clone.unbounded_send((__seq_id, Some((__response, __post, __transfer)))).is_err() {
+            let body = match (&method.output, is_async) {
+                (MethodOutput::Notify, None) => quote! {
+                    #call;
+                    web_rpc::service::ExecuteResult::Response(None)
+                },
+                (MethodOutput::Notify, Some(_)) => quote! {
+                    #call.await;
+                    web_rpc::service::ExecuteResult::Response(None)
+                },
+                (MethodOutput::Value(ty), None) => {
+                    let outgoing = encode_outgoing(ty, quote!(__response));
+                    quote! {
+                        let __response = #call;
+                        web_rpc::service::ExecuteResult::Response(Some({ #outgoing }))
+                    }
+                }
+                (MethodOutput::Value(ty), Some(_)) => {
+                    let outgoing = encode_outgoing(ty, quote!(__response));
+                    quote! {
+                        let mut __task = ::std::pin::pin!(web_rpc::futures_util::FutureExt::fuse(#call));
+                        web_rpc::service::ExecuteResult::Response(
+                            web_rpc::futures_util::select! {
+                                _ = __abort_rx => None,
+                                __response = __task => Some({ #outgoing }),
+                            }
+                        )
+                    }
+                }
+                (MethodOutput::Stream(item), is_async) => {
+                    let outgoing = encode_outgoing(item, quote!(__item));
+                    let forward = quote! {
+                        let mut __items = ::std::pin::pin!(__items);
+                        let mut __forward = ::std::pin::pin!(web_rpc::futures_util::FutureExt::fuse(async {
+                            while let Some(__item) = web_rpc::futures_util::StreamExt::next(&mut __items).await {
+                                let __outgoing = { #outgoing };
+                                if __stream_tx.unbounded_send((__sequence, Some(__outgoing))).is_err() {
                                     break;
                                 }
                             }
-                        };
-                        let __fwd = web_rpc::futures_util::FutureExt::fuse(__fwd);
-                        web_rpc::pin_utils::pin_mut!(__fwd);
+                        }));
                         web_rpc::futures_util::select! {
                             _ = __abort_rx => {},
-                            _ = __fwd => {},
+                            _ = __forward => {},
                         }
-                        let _ = __stream_tx.unbounded_send((__seq_id, None));
+                        let _ = __stream_tx.unbounded_send((__sequence, None));
                         web_rpc::service::ExecuteResult::StreamComplete
                     };
-
                     match is_async {
+                        None => quote! {
+                            let __items = #call;
+                            #forward
+                        },
                         Some(_) => quote! {
-                            #( #cfg_attrs )*
-                            #request_ident::#camel_case_ident { #( #destructure_fields ),* } => {
-                                #( #arg_decodes )*
-                                let __get_rx = web_rpc::futures_util::FutureExt::fuse(
-                                    self.server_impl.#ident(#( #call_args ),*)
-                                );
-                                web_rpc::pin_utils::pin_mut!(__get_rx);
-                                let __maybe_rx = web_rpc::futures_util::select! {
-                                    _ = __abort_rx => None,
-                                    __rx = __get_rx => Some(__rx),
-                                };
-                                if let Some(mut __user_rx) = __maybe_rx {
-                                    #fwd_body
-                                } else {
-                                    let _ = __stream_tx.unbounded_send((__seq_id, None));
+                            let mut __task = ::std::pin::pin!(web_rpc::futures_util::FutureExt::fuse(#call));
+                            let __items = web_rpc::futures_util::select! {
+                                _ = __abort_rx => None,
+                                __items = __task => Some(__items),
+                            };
+                            match __items {
+                                Some(__items) => { #forward }
+                                None => {
+                                    let _ = __stream_tx.unbounded_send((__sequence, None));
                                     web_rpc::service::ExecuteResult::StreamComplete
                                 }
                             }
                         },
-                        None => quote! {
-                            #( #cfg_attrs )*
-                            #request_ident::#camel_case_ident { #( #destructure_fields ),* } => {
-                                #( #arg_decodes )*
-                                let mut __user_rx = self.server_impl.#ident(#( #call_args ),*);
-                                #fwd_body
-                            }
-                        },
-                    }
-                } else {
-                    // Non-streaming.
-                    let resp_ident = Ident::new("__response", proc_macro2::Span::call_site());
-                    let return_transfer = make_return_transfer(&resp_ident);
-                    let return_response = match output {
-                        ReturnType::Type(_, ref ret_ty) => {
-                            let enc = emit_encode(ret_ty, quote!(__response), &quote!(&__post));
-                            quote! {
-                                let __post = web_rpc::js_sys::Array::new();
-                                let __transfer = web_rpc::js_sys::Array::new();
-                                let __wire = #enc;
-                                #return_transfer
-                                (#response_ident::#camel_case_ident(__wire), __post, __transfer)
-                            }
-                        }
-                        _ => {
-                            // Notification — emit a placeholder WireArg.
-                            quote! {
-                                let _ = __response;
-                                let __post = web_rpc::js_sys::Array::new();
-                                let __transfer = web_rpc::js_sys::Array::new();
-                                let __wire = web_rpc::codec::WireArg::Bytes(
-                                    web_rpc::bincode::serialize(&()).unwrap()
-                                );
-                                (#response_ident::#camel_case_ident(__wire), __post, __transfer)
-                            }
-                        }
-                    };
-
-                    match is_async {
-                        Some(_) => quote! {
-                            #( #cfg_attrs )*
-                            #request_ident::#camel_case_ident { #( #destructure_fields ),* } => {
-                                #( #arg_decodes )*
-                                let __task =
-                                    web_rpc::futures_util::FutureExt::fuse(self.server_impl.#ident(#( #call_args ),*));
-                                web_rpc::pin_utils::pin_mut!(__task);
-                                web_rpc::service::ExecuteResult::Response(
-                                    web_rpc::futures_util::select! {
-                                        _ = __abort_rx => None,
-                                        __response = __task => Some({
-                                            #return_response
-                                        })
-                                    }
-                                )
-                            }
-                        },
-                        None => quote! {
-                            #( #cfg_attrs )*
-                            #request_ident::#camel_case_ident { #( #destructure_fields ),* } => {
-                                #( #arg_decodes )*
-                                let __response = self.server_impl.#ident(#( #call_args ),*);
-                                web_rpc::service::ExecuteResult::Response(
-                                    Some({
-                                        #return_response
-                                    })
-                                )
-                            }
-                        }
                     }
                 }
-            });
+            };
+
+            quote! {
+                #( #cfg_attrs )*
+                #request_ident::#variant_ident { #( #destructure_fields ),* } => {
+                    #( #decodings )*
+                    #body
+                }
+            }
+        });
 
         quote! {
             #vis struct #service_ident<T> {
-                server_impl: T
+                implementation: T
             }
             impl<T: #trait_ident> web_rpc::service::Service for #service_ident<T> {
                 type Response = #response_ident;
+                #[allow(unused_mut, unused_variables)]
                 async fn execute(
                     &self,
-                    __seq_id: usize,
+                    __sequence: u32,
                     mut __abort_rx: web_rpc::futures_channel::oneshot::Receiver<()>,
-                    __payload: std::vec::Vec<u8>,
+                    __payload: ::std::vec::Vec<u8>,
                     __js_args: web_rpc::js_sys::Array,
                     __stream_tx: web_rpc::futures_channel::mpsc::UnboundedSender<
                         web_rpc::service::StreamMessage<Self::Response>
                     >,
-                ) -> (usize, web_rpc::service::ExecuteResult<Self::Response>) {
-                    let __request: #request_type = web_rpc::bincode::deserialize(&__payload).unwrap();
+                ) -> (u32, web_rpc::service::ExecuteResult<Self::Response>) {
+                    let __request: #request_ident<'_> =
+                        web_rpc::postcard::from_bytes(&__payload).unwrap();
                     let __result = match __request {
                         #( #handlers )*
                         #request_ident::__WebRpcPhantom(_) => {
                             unreachable!("web_rpc: __WebRpcPhantom variant received on wire")
                         }
                     };
-                    (__seq_id, __result)
+                    (__sequence, __result)
                 }
             }
-            impl<T: #trait_ident> std::convert::From<T> for #service_ident<T> {
-                fn from(server_impl: T) -> Self {
-                    Self { server_impl }
+            impl<T: #trait_ident> ::std::convert::From<T> for #service_ident<T> {
+                fn from(implementation: T) -> Self {
+                    Self { implementation }
                 }
             }
         }
     }
 }
 
-impl<'a> ToTokens for ServiceGenerator<'a> {
+impl ToTokens for ServiceGenerator<'_> {
     fn to_tokens(&self, output: &mut TokenStream2) {
-        output.extend(vec![
+        output.extend([
             self.enum_request(),
             self.enum_response(),
+            self.const_description(),
             self.trait_service(),
             self.struct_client(),
             self.struct_server(),
         ])
     }
 }
+
+// ---------------------------------------------------------------------------
+// Parsing
+// ---------------------------------------------------------------------------
 
 impl Parse for Service {
     fn parse(input: ParseStream) -> syn::Result<Self> {
@@ -997,95 +885,16 @@ impl Parse for Service {
         let ident: Ident = input.parse()?;
         let content;
         braced!(content in input);
-        let mut rpcs = Vec::<RpcMethod>::new();
+        let mut methods = Vec::new();
         while !content.is_empty() {
-            rpcs.push(content.parse()?);
+            methods.push(content.parse()?);
         }
-
         Ok(Self {
             attrs,
             vis,
             ident,
-            rpcs,
+            methods,
         })
-    }
-}
-
-/// Parsed RHS of a `name => ...` or `return => ...` clause.
-enum TransferRhs {
-    Expr(syn::Expr),
-    Gates(Vec<Gate>),
-}
-
-fn parse_transfer_rhs(input: ParseStream) -> syn::Result<TransferRhs> {
-    if input.peek(Token![|]) || input.peek(Token![||]) {
-        // Closure form: `|pat| body` (or `|| body` — rejected).
-        let closure: syn::ExprClosure = input.parse()?;
-        if closure.inputs.len() != 1 {
-            return Err(syn::Error::new_spanned(
-                &closure,
-                "transfer closure must have exactly one parameter",
-            ));
-        }
-        let pat = closure.inputs.into_iter().next().unwrap();
-        let body = *closure.body;
-        Ok(TransferRhs::Gates(vec![Gate { pat, body }]))
-    } else if input.peek(Token![match]) {
-        // `match { arms }` — no scrutinee. Bespoke syntax.
-        input.parse::<Token![match]>()?;
-        let content;
-        braced!(content in input);
-        let arms: Punctuated<syn::Arm, Token![,]> =
-            content.parse_terminated(syn::Arm::parse)?;
-        let gates = arms
-            .into_iter()
-            .map(|a| Gate {
-                pat: a.pat,
-                body: *a.body,
-            })
-            .collect();
-        Ok(TransferRhs::Gates(gates))
-    } else {
-        // Bare expression — only valid for params; the caller checks.
-        let body: syn::Expr = input.parse()?;
-        Ok(TransferRhs::Expr(body))
-    }
-}
-
-impl Parse for TransferClause {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let is_return = input.peek(Token![return]);
-        let lhs_name: Option<Ident> = if is_return {
-            input.parse::<Token![return]>()?;
-            None
-        } else {
-            Some(input.parse()?)
-        };
-
-        if input.peek(Token![=>]) {
-            input.parse::<Token![=>]>()?;
-            let rhs = parse_transfer_rhs(input)?;
-            match (lhs_name, rhs) {
-                (Some(name), TransferRhs::Expr(body)) => {
-                    Ok(TransferClause::ParamExpr { name, body })
-                }
-                (Some(name), TransferRhs::Gates(gates)) => {
-                    Ok(TransferClause::ParamGated { name, gates })
-                }
-                (None, TransferRhs::Gates(gates)) => {
-                    Ok(TransferClause::ReturnGated { gates })
-                }
-                (None, TransferRhs::Expr(_)) => Err(syn::Error::new(
-                    input.span(),
-                    "`return =>` requires a closure (`|pat| body`) or `match { arms }` block",
-                )),
-            }
-        } else {
-            Ok(match lhs_name {
-                Some(name) => TransferClause::BareParam(name),
-                None => TransferClause::BareReturn,
-            })
-        }
     }
 }
 
@@ -1094,47 +903,11 @@ impl Parse for RpcMethod {
         let mut errors = Ok(());
         let attrs = input.call(Attribute::parse_outer)?;
 
-        // Reject the removed `#[post(...)]` attribute with a migration message.
-        for attr in &attrs {
-            if attr
-                .path
-                .segments
-                .last()
-                .is_some_and(|seg| seg.ident == "post")
-            {
-                extend_errors!(
-                    errors,
-                    syn::Error::new_spanned(
-                        attr,
-                        "`#[post(...)]` has been removed. JS-vs-serialize routing is now \
-                         inferred from each argument and return type. For transfer semantics, \
-                         use `#[transfer(...)]` (e.g. `#[transfer(canvas)]`, \
-                         `#[transfer(data => data.buffer())]`, or \
-                         `#[transfer(return => |Ok(o)| o.buffer())]`)."
-                    )
-                );
-            }
-        }
-
-        // Partition out the new `#[transfer(...)]` attribute(s).
-        let (transfer_attrs, attrs): (Vec<_>, Vec<_>) = attrs.into_iter().partition(|attr| {
-            attr.path
-                .segments
-                .last()
-                .is_some_and(|last_segment| last_segment.ident == "transfer")
-        });
-        let mut transfer: Vec<TransferClause> = Vec::new();
-        for transfer_attr in transfer_attrs {
-            let parsed = transfer_attr
-                .parse_args_with(Punctuated::<TransferClause, Token![,]>::parse_terminated)?;
-            transfer.extend(parsed.into_iter());
-        }
-
         let is_async = input.parse::<Token![async]>().ok();
         input.parse::<Token![fn]>()?;
         let ident: Ident = input.parse()?;
 
-        // Reject generic methods up front — autoref dispatch needs concrete types.
+        // Reject generic methods up front: the description needs concrete types.
         if input.peek(Token![<]) {
             let generics: syn::Generics = input.parse()?;
             extend_errors!(
@@ -1142,7 +915,8 @@ impl Parse for RpcMethod {
                 syn::Error::new_spanned(
                     generics,
                     "web_rpc::service trait methods may not have generic parameters; \
-                     concrete types are required so the macro can route each argument."
+                     concrete types are required so the macro can route and describe each \
+                     argument."
                 )
             );
         }
@@ -1151,86 +925,50 @@ impl Parse for RpcMethod {
         parenthesized!(content in input);
         let mut receiver: Option<syn::Receiver> = None;
         let mut args = Vec::new();
-        for arg in content.parse_terminated::<FnArg, Comma>(FnArg::parse)? {
-            match arg {
-                FnArg::Typed(captured) => match &*captured.pat {
-                    Pat::Ident(_) => {
-                        // Reject reference args other than `&str`/`&[u8]`/`&JsT`.
-                        // (The is_js_ref / is_borrowed_serde_ref classifiers will
-                        // accept any reference; we let them through here and rely
-                        // on the receiver-side decoder to fail on unsupported
-                        // shapes. A dedicated diagnostic comes later.)
-                        args.push(captured)
-                    }
+        for argument in content.parse_terminated(FnArg::parse, Token![,])? {
+            match argument {
+                FnArg::Typed(typed) => match &*typed.pat {
+                    Pat::Ident(_) => args.push(typed),
                     _ => extend_errors!(
                         errors,
                         syn::Error::new(
-                            captured.pat.span(),
+                            typed.pat.span(),
                             "patterns are not allowed in RPC arguments"
                         )
                     ),
                 },
-                FnArg::Receiver(ref recv) => {
-                    if recv.reference.is_none() || recv.mutability.is_some() {
+                FnArg::Receiver(ref parsed) => {
+                    if parsed.reference.is_none() || parsed.mutability.is_some() {
                         extend_errors!(
                             errors,
                             syn::Error::new(
-                                arg.span(),
+                                argument.span(),
                                 "RPC methods only support `&self` as a receiver"
                             )
                         );
                     }
-                    receiver = Some(recv.clone());
+                    receiver = Some(parsed.clone());
                 }
             }
         }
-        let receiver = match receiver {
-            Some(r) => r,
-            None => {
-                extend_errors!(
-                    errors,
-                    syn::Error::new(
-                        ident.span(),
-                        "RPC methods must include `&self` as the first parameter"
-                    )
-                );
-                parse_quote!(&self)
-            }
+        let receiver = receiver.unwrap_or_else(|| {
+            extend_errors!(
+                errors,
+                syn::Error::new(
+                    ident.span(),
+                    "RPC methods must include `&self` as the first parameter"
+                )
+            );
+            parse_quote!(&self)
+        });
+        let output = match input.parse::<ReturnType>()? {
+            ReturnType::Default => MethodOutput::Notify,
+            ReturnType::Type(_, ty) => match stream_item_type(&ty) {
+                Some(item) => MethodOutput::Stream(item.clone()),
+                None => MethodOutput::Value(*ty),
+            },
         };
-        let output: ReturnType = input.parse()?;
         input.parse::<Token![;]>()?;
-
-        // Validate that every transfer clause references a real parameter
-        // (or `return`, which has no name to check).
-        let arg_names: HashSet<_> = args
-            .iter()
-            .filter_map(|arg| match &*arg.pat {
-                Pat::Ident(pat_ident) => Some(pat_ident.ident.clone()),
-                _ => None,
-            })
-            .collect();
-        for clause in &transfer {
-            let name_ref = match clause {
-                TransferClause::BareParam(name)
-                | TransferClause::ParamExpr { name, .. }
-                | TransferClause::ParamGated { name, .. } => Some(name),
-                TransferClause::BareReturn | TransferClause::ReturnGated { .. } => None,
-            };
-            if let Some(name) = name_ref {
-                if !arg_names.contains(name) {
-                    extend_errors!(
-                        errors,
-                        syn::Error::new(
-                            name.span(),
-                            format!(
-                                "`{}` in #[transfer(...)] does not match any parameter",
-                                name
-                            )
-                        )
-                    );
-                }
-            }
-        }
         errors?;
 
         Ok(Self {
@@ -1239,16 +977,16 @@ impl Parse for RpcMethod {
             receiver,
             ident,
             args,
-            transfer,
             output,
         })
     }
 }
 
-/// This attribute macro should applied to traits that need to be turned into RPCs. The
-/// macro will consume the trait and output three items in its place. For example,
-/// a trait `Calculator` will be replaced with two structs `CalculatorClient` and
-/// `CalculatorService` and a new trait by the same name. All methods must include
+/// This attribute macro should be applied to traits that need to be turned into RPCs. The macro
+/// consumes the trait and outputs four items in its place. For a trait `Calculator` those are
+/// the structs `CalculatorClient` and `CalculatorService`, a new trait by the same name, and a
+/// `CALCULATOR_DESCRIPTION` const describing the trait for
+/// [`web_rpc::js::endpoint!`](../web_rpc/js/macro.endpoint.html). All methods must include
 /// `&self` as their first parameter.
 #[proc_macro_attribute]
 pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
@@ -1256,53 +994,230 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
         ref attrs,
         ref vis,
         ref ident,
-        ref rpcs,
+        ref methods,
     } = parse_macro_input!(input as Service);
-
-    let camel_case_fn_names: &Vec<_> = &rpcs
-        .iter()
-        .map(|rpc| snake_to_camel(&rpc.ident.unraw().to_string()))
-        .collect();
-
-    let has_streaming_methods = rpcs.iter().any(
-        |rpc| matches!(&rpc.output, ReturnType::Type(_, ref ty) if stream_item_type(ty).is_some()),
-    );
 
     ServiceGenerator {
         trait_ident: ident,
-        service_ident: &format_ident!("{}Service", ident),
-        client_ident: &format_ident!("{}Client", ident),
-        request_ident: &format_ident!("{}Request", ident),
-        response_ident: &format_ident!("{}Response", ident),
+        service_ident: format_ident!("{}Service", ident),
+        client_ident: format_ident!("{}Client", ident),
+        request_ident: format_ident!("{}Request", ident),
+        response_ident: format_ident!("{}Response", ident),
+        description_ident: format_ident!("{}_DESCRIPTION", screaming_snake(ident)),
         vis,
         attrs,
-        rpcs,
-        camel_case_idents: &rpcs
-            .iter()
-            .zip(camel_case_fn_names.iter())
-            .map(|(rpc, name)| Ident::new(name, rpc.ident.span()))
-            .collect::<Vec<_>>(),
-        has_streaming_methods,
+        methods,
     }
     .into_token_stream()
     .into()
 }
 
-fn snake_to_camel(ident_str: &str) -> String {
-    let mut camel_ty = String::with_capacity(ident_str.len());
+// ---------------------------------------------------------------------------
+// js::endpoint!
+// ---------------------------------------------------------------------------
 
-    let mut last_char_was_underscore = true;
-    for c in ident_str.chars() {
-        match c {
-            '_' => last_char_was_underscore = true,
-            c if last_char_was_underscore => {
-                camel_ty.extend(c.to_uppercase());
-                last_char_was_underscore = false;
+/// The parsed arguments of `js::endpoint!`.
+struct EndpointArgs {
+    service: Option<Path>,
+    client: Option<Path>,
+}
+
+impl Parse for EndpointArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut service = None;
+        let mut client = None;
+        for entry in Punctuated::<EndpointArg, Token![,]>::parse_terminated(input)? {
+            let (slot, path, key) = match entry {
+                EndpointArg::Service(path) => (&mut service, path, "service"),
+                EndpointArg::Client(path) => (&mut client, path, "client"),
+            };
+            if slot.replace(path).is_some() {
+                return Err(syn::Error::new(
+                    input.span(),
+                    format!("`{key}` is given more than once"),
+                ));
             }
-            c => camel_ty.extend(c.to_lowercase()),
+        }
+        if service.is_none() && client.is_none() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "a Javascript endpoint needs at least one of `service = ...` (the trait it \
+                 implements) and `client = ...` (the trait it calls)",
+            ));
+        }
+        Ok(Self { service, client })
+    }
+}
+
+enum EndpointArg {
+    Service(Path),
+    Client(Path),
+}
+
+impl Parse for EndpointArg {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let key: Ident = input.parse()?;
+        input.parse::<Token![=]>()?;
+        if key == "service" {
+            Ok(EndpointArg::Service(input.parse()?))
+        } else if key == "client" {
+            Ok(EndpointArg::Client(input.parse()?))
+        } else {
+            Err(syn::Error::new(
+                key.span(),
+                "expected `service` or `client`",
+            ))
         }
     }
+}
 
-    camel_ty.shrink_to_fit();
-    camel_ty
+/// Rewrite `some::path::FooService` (or `FooClient`) into `some::path::FOO_DESCRIPTION`.
+fn description_path(path: &Path) -> syn::Result<Path> {
+    let span = path.span();
+    let mut path = path.clone();
+    let last = path
+        .segments
+        .last_mut()
+        .ok_or_else(|| syn::Error::new(span, "expected a generated Service or Client"))?;
+    let name = last.ident.to_string();
+    let trait_name = name
+        .strip_suffix("Service")
+        .or_else(|| name.strip_suffix("Client"))
+        .filter(|trait_name| !trait_name.is_empty())
+        .ok_or_else(|| {
+            syn::Error::new(
+                last.ident.span(),
+                "expected a name generated by #[web_rpc::service], which ends in `Service` or \
+                 `Client`",
+            )
+        })?;
+    last.ident = format_ident!(
+        "{}_DESCRIPTION",
+        screaming_snake_str(trait_name),
+        span = last.ident.span()
+    );
+    last.arguments = syn::PathArguments::None;
+    Ok(path)
+}
+
+/// Render a Javascript endpoint and a `.d.ts` for the other end of a connection into two custom
+/// sections of the wasm binary. See the [`web_rpc::js`](../web_rpc/js/index.html) module.
+#[proc_macro]
+pub fn endpoint(input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(input as EndpointArgs);
+
+    let class_path = args.client.as_ref().or(args.service.as_ref()).unwrap();
+    let class_name = class_path.segments.last().unwrap().ident.to_string();
+    let snake = snake_case_str(&class_name);
+    let screaming = screaming_snake_str(&class_name);
+
+    let description = |path: Option<&Path>| match path.map(description_path) {
+        Some(Ok(path)) => Ok(quote!(::core::option::Option::Some(#path))),
+        Some(Err(error)) => Err(error.to_compile_error()),
+        None => Ok(quote!(::core::option::Option::None)),
+    };
+    let service_description = match description(args.service.as_ref()) {
+        Ok(tokens) => tokens,
+        Err(error) => return error.into(),
+    };
+    let client_description = match description(args.client.as_ref()) {
+        Ok(tokens) => tokens,
+        Err(error) => return error.into(),
+    };
+
+    let endpoint_ident = format_ident!("__WEB_RPC_ENDPOINT_{screaming}");
+    let js_length_ident = format_ident!("__WEB_RPC_ENDPOINT_{screaming}_JS_LENGTH");
+    let js_ident = format_ident!("__WEB_RPC_ENDPOINT_{screaming}_JS");
+    let dts_length_ident = format_ident!("__WEB_RPC_ENDPOINT_{screaming}_DTS_LENGTH");
+    let dts_ident = format_ident!("__WEB_RPC_ENDPOINT_{screaming}_DTS");
+    let guard_ident = format_ident!("__web_rpc_{snake}");
+    let js_section = format!("__web_rpc_{snake}_js");
+    let dts_section = format!("__web_rpc_{snake}_d_ts");
+
+    quote! {
+        #[doc(hidden)]
+        const #endpoint_ident: web_rpc::js::Endpoint = web_rpc::js::Endpoint {
+            class: #class_name,
+            service: #service_description,
+            client: #client_description,
+        };
+        #[doc(hidden)]
+        const #js_length_ident: usize = web_rpc::js::render_js::<0>(&#endpoint_ident).length;
+        #[doc(hidden)]
+        #[allow(long_running_const_eval)]
+        const #js_ident: [u8; #js_length_ident] =
+            web_rpc::js::render_js::<#js_length_ident>(&#endpoint_ident).bytes;
+        #[doc(hidden)]
+        const #dts_length_ident: usize = web_rpc::js::render_dts::<0>(&#endpoint_ident).length;
+        #[doc(hidden)]
+        #[allow(long_running_const_eval)]
+        const #dts_ident: [u8; #dts_length_ident] =
+            web_rpc::js::render_dts::<#dts_length_ident>(&#endpoint_ident).bytes;
+
+        const _: () = {
+            #[used]
+            #[link_section = #js_section]
+            static JS: [u8; #js_length_ident] = #js_ident;
+            #[used]
+            #[link_section = #dts_section]
+            static D_TS: [u8; #dts_length_ident] = #dts_ident;
+            // Two endpoints with the same class name in one binary would concatenate into the
+            // same custom section, so make that a duplicate symbol error instead.
+            #[no_mangle]
+            static #guard_ident: u8 = 0;
+        };
+    }
+    .into()
+}
+
+// ---------------------------------------------------------------------------
+// Name conversions
+// ---------------------------------------------------------------------------
+
+/// `add_numbers` becomes `AddNumbers`: the variant name of a method.
+fn snake_to_camel(name: &str) -> String {
+    let mut camel = String::with_capacity(name.len());
+    let mut capitalize_next = true;
+    for character in name.chars() {
+        match character {
+            '_' => capitalize_next = true,
+            character if capitalize_next => {
+                camel.extend(character.to_uppercase());
+                capitalize_next = false;
+            }
+            character => camel.extend(character.to_lowercase()),
+        }
+    }
+    camel
+}
+
+/// `add_numbers` becomes `addNumbers`: the wire name of a method or an argument.
+fn to_lower_camel(name: &str) -> String {
+    let camel = snake_to_camel(name);
+    let mut characters = camel.chars();
+    match characters.next() {
+        Some(first) => first.to_lowercase().chain(characters).collect(),
+        None => camel,
+    }
+}
+
+/// `FooBar` becomes `FOO_BAR`: the prefix of the description const.
+fn screaming_snake(ident: &Ident) -> String {
+    screaming_snake_str(&ident.to_string())
+}
+
+fn screaming_snake_str(name: &str) -> String {
+    snake_case_str(name).to_uppercase()
+}
+
+/// `FooBar` becomes `foo_bar`: the section name of an endpoint.
+fn snake_case_str(name: &str) -> String {
+    let mut snake = String::with_capacity(name.len() + 4);
+    for (index, character) in name.chars().enumerate() {
+        if character.is_uppercase() && index > 0 {
+            snake.push('_');
+        }
+        snake.extend(character.to_lowercase());
+    }
+    snake
 }

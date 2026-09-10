@@ -1,115 +1,98 @@
 use std::collections::HashMap;
 
 use futures_channel::{mpsc, oneshot};
-use futures_core::{future::LocalBoxFuture, Future};
-use futures_util::{future::Shared, stream::FuturesUnordered, StreamExt};
-use js_sys::{Array, Uint8Array};
+use futures_core::Future;
+use futures_util::{stream::FuturesUnordered, StreamExt};
+use js_sys::Array;
 use serde::Serialize;
 
-pub enum ExecuteResult<R> {
-    /// Single response (Some) or notification (None)
-    Response(Option<(R, Array, Array)>),
-    /// Stream completed — end signal was sent through stream_tx
+use crate::{port::Port, Dispatcher, MessageHeader};
+
+/// A response with its Javascript values and its transfer list.
+pub type Outgoing<Response> = (Response, Array, Array);
+
+pub enum ExecuteResult<Response> {
+    /// What to post back, if anything. A notification and an aborted request post nothing.
+    Response(Option<Outgoing<Response>>),
+    /// The stream ended. Its end marker already travelled through the item channel, behind
+    /// the last item, so nothing more is posted here.
     StreamComplete,
 }
 
-/// Stream messages: Some = item, None = end of stream
-pub type StreamMessage<R> = (usize, Option<(R, Array, Array)>);
+/// One message of a stream: an item, or `None` once it ends.
+pub type StreamMessage<Response> = (u32, Option<Outgoing<Response>>);
 
 pub trait Service {
     type Response;
 
     fn execute(
         &self,
-        seq_id: usize,
+        sequence: u32,
         abort_rx: oneshot::Receiver<()>,
         payload: Vec<u8>,
         js_args: Array,
         stream_tx: mpsc::UnboundedSender<StreamMessage<Self::Response>>,
-    ) -> impl Future<Output = (usize, ExecuteResult<Self::Response>)>;
+    ) -> impl Future<Output = (u32, ExecuteResult<Self::Response>)>;
 }
+
+/// An inbound request: sequence number, payload bytes, and the Javascript values behind them.
+pub type Request = (u32, Vec<u8>, Array);
 
 pub(crate) async fn task<S>(
     service: S,
-    port: crate::port::Port,
-    mut dispatcher: Shared<LocalBoxFuture<'static, ()>>,
-    mut server_requests_rx: mpsc::UnboundedReceiver<(usize, Vec<u8>, js_sys::Array)>,
-    mut abort_requests_rx: mpsc::UnboundedReceiver<usize>,
+    port: Port,
+    mut dispatcher: Dispatcher,
+    mut requests_rx: mpsc::UnboundedReceiver<Request>,
+    mut aborts_rx: mpsc::UnboundedReceiver<u32>,
 ) where
     S: Service + 'static,
-    <S as Service>::Response: Serialize,
+    S::Response: Serialize,
 {
     let (stream_tx, mut stream_rx) = mpsc::unbounded();
-    let mut server_tasks: HashMap<usize, oneshot::Sender<_>> = Default::default();
-    let mut server_responses_rx: FuturesUnordered<_> = Default::default();
+    let mut running: HashMap<u32, oneshot::Sender<()>> = HashMap::new();
+    let mut executions: FuturesUnordered<_> = FuturesUnordered::new();
     loop {
         futures_util::select! {
             _ = dispatcher => {}
-            server_request = server_requests_rx.next() => {
-                let (seq_id, payload, post_args) = server_request.unwrap();
-                let (abort_tx, abort_rx) = oneshot::channel::<()>();
-                server_tasks.insert(seq_id, abort_tx);
-                server_responses_rx.push(
-                    service.execute(seq_id, abort_rx, payload, post_args, stream_tx.clone())
-                );
+            request = requests_rx.next() => {
+                let (sequence, payload, js_args) = request.expect("web_rpc: the request channel closed");
+                let (abort_tx, abort_rx) = oneshot::channel();
+                running.insert(sequence, abort_tx);
+                executions.push(service.execute(sequence, abort_rx, payload, js_args, stream_tx.clone()));
             },
-            abort_request = abort_requests_rx.next() => {
-                if let Some(seq_id) = abort_request {
-                    if let Some(abort_tx) = server_tasks.remove(&seq_id) {
+            abort = aborts_rx.next() => {
+                if let Some(sequence) = abort {
+                    if let Some(abort_tx) = running.remove(&sequence) {
                         let _ = abort_tx.send(());
                     }
                 }
             },
-            stream_msg = stream_rx.next() => {
-                if let Some((seq_id, msg)) = stream_msg {
-                    match msg {
-                        Some((response, post_args, transfer_args)) => {
-                            let header = crate::MessageHeader::StreamItem(seq_id);
-                            let header_bytes = bincode::serialize(&header).unwrap();
-                            let header_buffer = Uint8Array::from(&header_bytes[..]).buffer();
-                            let response_bytes = bincode::serialize(&response).unwrap();
-                            let response_buffer = Uint8Array::from(&response_bytes[..]).buffer();
-                            post_args.unshift(&response_buffer);
-                            post_args.unshift(&header_buffer);
-                            transfer_args.unshift(&response_buffer);
-                            transfer_args.unshift(&header_buffer);
-                            port.post_message(&post_args, &transfer_args).unwrap();
+            message = stream_rx.next() => {
+                if let Some((sequence, message)) = message {
+                    match message {
+                        Some((item, post_args, transfer_args)) => {
+                            crate::post_message(&port, MessageHeader::StreamItem(sequence), &item, &post_args, &transfer_args);
                         }
                         None => {
-                            server_tasks.remove(&seq_id);
-                            let header = crate::MessageHeader::StreamEnd(seq_id);
-                            let header_bytes = bincode::serialize(&header).unwrap();
-                            let header_buffer = Uint8Array::from(&header_bytes[..]).buffer();
-                            let post_args = js_sys::Array::of1(&header_buffer);
-                            let transfer_args = js_sys::Array::of1(&header_buffer);
-                            port.post_message(&post_args, &transfer_args).unwrap();
+                            running.remove(&sequence);
+                            crate::post_header(&port, MessageHeader::StreamEnd(sequence));
                         }
                     }
                 }
             },
-            server_response = server_responses_rx.next() => {
-                if let Some((seq_id, result)) = server_response {
+            execution = executions.next() => {
+                if let Some((sequence, result)) = execution {
                     match result {
                         ExecuteResult::Response(response) => {
-                            if server_tasks.remove(&seq_id).is_some() {
+                            // An aborted request has already been forgotten, and its response
+                            // is dropped with it.
+                            if running.remove(&sequence).is_some() {
                                 if let Some((response, post_args, transfer_args)) = response {
-                                    let header = crate::MessageHeader::Response(seq_id);
-                                    let header_bytes = bincode::serialize(&header).unwrap();
-                                    let header_buffer = Uint8Array::from(&header_bytes[..]).buffer();
-                                    let response_bytes = bincode::serialize(&response).unwrap();
-                                    let response_buffer = Uint8Array::from(&response_bytes[..]).buffer();
-                                    post_args.unshift(&response_buffer);
-                                    post_args.unshift(&header_buffer);
-                                    transfer_args.unshift(&response_buffer);
-                                    transfer_args.unshift(&header_buffer);
-                                    port.post_message(&post_args, &transfer_args).unwrap();
+                                    crate::post_message(&port, MessageHeader::Response(sequence), &response, &post_args, &transfer_args);
                                 }
                             }
                         }
-                        ExecuteResult::StreamComplete => {
-                            // End signal already sent through stream_tx
-                            server_tasks.remove(&seq_id);
-                        }
+                        ExecuteResult::StreamComplete => {}
                     }
                 }
             }
