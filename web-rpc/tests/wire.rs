@@ -1,7 +1,7 @@
-//! The byte strings in `WIRE.md`, asserted against the types they were derived from.
+//! The wire format's byte strings, asserted against the types they were derived from.
 //!
-//! A Javascript implementation of the protocol is written against `WIRE.md`, so these fixtures
-//! are what stop the document and the Rust enums from drifting apart.
+//! `tests/js/codec.test.mjs` asserts the same byte strings against the Javascript shell, so
+//! between them these fixtures are what stop the two implementations from drifting apart.
 
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};

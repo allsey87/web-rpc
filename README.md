@@ -96,7 +96,7 @@ Add `--remove-section=...` for each to strip them from what you ship. The `.mjs`
 
 ## Migrating from 0.0.7
 
-Both ends must be on 0.0.8: the wire format changed from bincode to postcard. See [WIRE.md](WIRE.md) for the format itself.
+Both ends must be on 0.0.8: the wire format changed from bincode to postcard.
 
 - Replace bare JavaScript types in signatures with `Post<T>` or `Transfer<T>`, and delete every `#[transfer(...)]`. The compiler finds all the sites. A typed array is not transferable: send `Transfer<ArrayBuffer>` and rebuild the view on the other side.
 - Add `#[derive(Schema)]` to every payload type reachable from a `#[web_rpc::service]` trait, and add `postcard-schema` as a direct dependency, since the derive emits `::postcard_schema::` paths. A foreign type with no upstream impl needs a local mirror type. `usize` and `isize` have no `Schema` impl, because serde widens them to `u64`/`i64` and their Rust-side width is a property of the target; use a fixed-width integer.

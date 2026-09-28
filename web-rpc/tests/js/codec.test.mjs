@@ -1,6 +1,5 @@
-// The shell's codec against the byte strings in WIRE.md, which tests/wire.rs asserts for the
-// Rust side. Run by tests/js/check.py after extraction, since the shell only exists inside a
-// generated module.
+// The shell's codec against the same byte strings tests/wire.rs asserts for the Rust side. Run
+// by tests/js/check.py after extraction, since the shell only exists inside a generated module.
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
