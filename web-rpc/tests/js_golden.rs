@@ -2,6 +2,7 @@
 //!
 //! Between them the traits reach every rule of the Javascript conventions: each primitive,
 //! every container shape, both wrapper types, `Option` and `Result` in every position,
+//! wrappers inside `Vec`, arrays and maps,
 //! borrowed arguments, notifications, streams, a trailing optional argument, a reserved word, and a `#[cfg]`
 //! that strips a method so that the one after it takes its index. There are no test
 //! functions here: building this file renders the endpoints into the test binary, and
@@ -69,6 +70,12 @@ pub trait Calculator {
     fn tail(&self, delete: u32, extra: Option<u32>) -> u32;
     fn nothing(&self);
     fn borrowed(&self, text: &str, data: &[u8]) -> u32;
+    fn batch(&self, buffers: Vec<Transfer<js_sys::ArrayBuffer>>) -> Vec<u32>;
+    fn corners(&self, points: [Point; 2]) -> [Option<Post<js_sys::JsString>>; 2];
+    fn index(
+        &self,
+        names: Option<Vec<String>>,
+    ) -> Result<std::collections::BTreeMap<String, Vec<Transfer<js_sys::ArrayBuffer>>>, Colour>;
 }
 
 /// The trait a Javascript endpoint implements.

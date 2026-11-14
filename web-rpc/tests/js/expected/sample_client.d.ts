@@ -36,6 +36,10 @@ export declare class SampleClient {
   counters(count: number, callback: (item: number) => void | Promise<void>): Subscription;
   slow(millis: number): Request<number>;
   borrowed(text: string, data: Uint8Array): Request<string>;
+  sizes(buffers: (ArrayBuffer)[]): Request<(number)[]>;
+  named(sizes: (number)[]): Request<Map<string, (ArrayBuffer | undefined)>>;
+  pair(sizes: [number, number]): Request<(ArrayBuffer)[]>;
+  scale(value: number, factor?: number): Request<(number | undefined)>;
   /** Detach listeners, reject pending requests and close open streams. */
   close(): void;
 }

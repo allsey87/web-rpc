@@ -8,7 +8,7 @@
 
 mod common;
 
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc, time::Duration};
 
 use futures_core::Stream;
 use futures_util::{FutureExt, StreamExt};
@@ -54,6 +54,10 @@ pub trait Sample {
     fn counters(&self, count: u32) -> impl Stream<Item = u32>;
     async fn slow(&self, millis: u32) -> u32;
     fn borrowed(&self, text: &str, data: &[u8]) -> String;
+    fn sizes(&self, buffers: Vec<Transfer<js_sys::ArrayBuffer>>) -> Vec<u32>;
+    fn named(&self, sizes: Vec<u32>) -> BTreeMap<String, Option<Transfer<js_sys::ArrayBuffer>>>;
+    fn pair(&self, sizes: [u32; 2]) -> [Transfer<js_sys::ArrayBuffer>; 2];
+    fn scale(&self, value: u32, factor: Option<u32>) -> Option<u32>;
 }
 
 web_rpc::js::endpoint!(client = SampleClient);
@@ -106,6 +110,11 @@ const HANDLERS: &str = r#"{
         return millis;
     },
     borrowed: (text, data) => `${text}:${data.length}`,
+    sizes: (buffers) => buffers.map((buffer) => buffer.byteLength),
+    named: (sizes) =>
+        new Map(sizes.map((size) => [`b${size}`, size > 0 ? new ArrayBuffer(size) : undefined])),
+    pair: (sizes) => sizes.map((size) => new ArrayBuffer(size)),
+    scale: (value, factor) => (factor === undefined ? undefined : value * factor),
 }"#;
 
 #[derive(Default)]
@@ -176,6 +185,24 @@ impl Sample for SampleImpl {
     }
     fn borrowed(&self, text: &str, data: &[u8]) -> String {
         format!("{text}:{}", data.len())
+    }
+    fn sizes(&self, buffers: Vec<Transfer<js_sys::ArrayBuffer>>) -> Vec<u32> {
+        buffers.iter().map(|buffer| buffer.byte_length()).collect()
+    }
+    fn named(&self, sizes: Vec<u32>) -> BTreeMap<String, Option<Transfer<js_sys::ArrayBuffer>>> {
+        sizes
+            .into_iter()
+            .map(|size| {
+                let buffer = js_sys::Uint8Array::new_with_length(size).buffer();
+                (format!("b{size}"), (size > 0).then(|| Transfer(buffer)))
+            })
+            .collect()
+    }
+    fn pair(&self, sizes: [u32; 2]) -> [Transfer<js_sys::ArrayBuffer>; 2] {
+        sizes.map(|size| Transfer(js_sys::Uint8Array::new_with_length(size).buffer()))
+    }
+    fn scale(&self, value: u32, factor: Option<u32>) -> Option<u32> {
+        factor.map(|factor| value * factor)
     }
 }
 
@@ -381,6 +408,44 @@ async fn rust_serves_js_calls() {
         .unwrap();
     assert_eq!(string(&borrowed), "ab:3");
 
+    let first = js_sys::Uint8Array::new_with_length(4).buffer();
+    let second = js_sys::Uint8Array::new_with_length(6).buffer();
+    let sizes = call(
+        &client,
+        "sizes",
+        args([args([first.clone().into(), second.clone().into()]).into()]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(json(&sizes), "[4,6]");
+    assert_eq!(first.byte_length() + second.byte_length(), 0);
+
+    let named: js_sys::Map = call(&client, "named", args([args([0.into(), 3.into()]).into()]))
+        .await
+        .unwrap()
+        .into();
+    assert_eq!(named.size(), 2);
+    assert!(named.get(&"b0".into()).is_undefined());
+    let buffer: js_sys::ArrayBuffer = named.get(&"b3".into()).into();
+    assert_eq!(buffer.byte_length(), 3);
+
+    let pair: js_sys::Array = call(&client, "pair", args([args([2.into(), 5.into()]).into()]))
+        .await
+        .unwrap()
+        .into();
+    assert_eq!(pair.length(), 2);
+    let second: js_sys::ArrayBuffer = pair.get(1).into();
+    assert_eq!(second.byte_length(), 5);
+
+    // An `Option` with no Javascript value inside is one postcard payload, and a trailing
+    // one may be left out.
+    let scaled = call(&client, "scale", args([6.into(), 7.into()])).await;
+    assert_eq!(number(&scaled.unwrap()), 42.0);
+    assert!(call(&client, "scale", args([6.into()]))
+        .await
+        .unwrap()
+        .is_undefined());
+
     // `Request.abort()` rejects locally and stops the service.
     let aborted = harness(
         "abort",
@@ -479,6 +544,22 @@ async fn js_serves_rust_calls() {
     assert_eq!(number(&field(&probe(&handle).await, "finished")), 1.0);
 
     assert_eq!(client.borrowed("ab", &[7, 8, 9]).await, "ab:3");
+
+    let first = js_sys::Uint8Array::new_with_length(4).buffer();
+    let second = js_sys::Uint8Array::new_with_length(6).buffer();
+    let buffers = vec![Transfer(first.clone()), Transfer(second.clone())];
+    assert_eq!(client.sizes(buffers).await, vec![4, 6]);
+    assert_eq!(first.byte_length() + second.byte_length(), 0);
+
+    let named = client.named(vec![0, 3]).await;
+    assert_eq!(named.len(), 2);
+    assert_eq!(named["b0"], None);
+    assert_eq!(named["b3"].as_ref().unwrap().byte_length(), 3);
+
+    let [first, second] = client.pair([2, 5]).await;
+    assert_eq!((first.byte_length(), second.byte_length()), (2, 5));
+    assert_eq!(client.scale(6, Some(7)).await, Some(42));
+    assert_eq!(client.scale(6, None).await, None);
 
     assert_eq!(client.slow(20).await, 20);
 }

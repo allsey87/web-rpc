@@ -3,7 +3,7 @@
 use postcard_schema::schema::{DataModelType, DataModelVariant, NamedType};
 
 use super::{
-    decls::{collect, is_declared},
+    decls::{collect, is_declared, result_schema},
     method_at, method_count,
     writer::Output,
 };
@@ -181,6 +181,18 @@ const fn desc_type<const CAPACITY: usize>(output: &mut Output<CAPACITY>, desc: &
             desc_type(output, err);
             output.put(" })");
         }
+        Desc::Seq(inner) | Desc::Array(inner, _) => {
+            output.put("(");
+            desc_type(output, inner);
+            output.put(")[]");
+        }
+        Desc::Map(key, value) => {
+            output.put("Map<");
+            type_reference(output, key);
+            output.put(", ");
+            desc_type(output, value);
+            output.put(">");
+        }
     }
 }
 
@@ -191,9 +203,32 @@ const fn desc_type<const CAPACITY: usize>(output: &mut Output<CAPACITY>, desc: &
 /// rejects with the decoded `Err`, and a handler returns the `Ok` payload or throws.
 const fn return_type<const CAPACITY: usize>(output: &mut Output<CAPACITY>, desc: &'static Desc) {
     match desc {
+        Desc::Result(ok, _) => payload_type(output, ok),
+        Desc::Postcard(named_type) => match result_schema(named_type) {
+            Some((ok, _)) if is_unit(ok) => output.put("void"),
+            Some((ok, _)) => type_reference(output, ok),
+            None => payload_type(output, desc),
+        },
+        other => payload_type(output, other),
+    }
+}
+
+/// Render what a promise resolves with: `void` for `()`, otherwise the value's own type.
+const fn payload_type<const CAPACITY: usize>(output: &mut Output<CAPACITY>, desc: &'static Desc) {
+    match desc {
         Desc::Postcard(named_type) if is_unit(named_type) => output.put("void"),
-        Desc::Result(ok, _) => return_type(output, ok),
         other => desc_type(output, other),
+    }
+}
+
+/// The schema inside an `Option` that has no `Post` or `Transfer` in it.
+const fn option_schema(desc: &'static Desc) -> Option<&'static NamedType> {
+    match desc {
+        Desc::Postcard(named_type) => match named_type.ty {
+            DataModelType::Option(inner) => Some(*inner),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -206,7 +241,8 @@ const fn is_optional_argument(method: &'static Method, index: usize) -> bool {
     }
     let mut position = index;
     while position < method.args.len() {
-        if !matches!(method.args[position].desc, Desc::Option(_)) {
+        let desc = method.args[position].desc;
+        if !matches!(desc, Desc::Option(_)) && option_schema(desc).is_none() {
             return false;
         }
         position += 1;
@@ -225,9 +261,10 @@ const fn parameters<const CAPACITY: usize>(output: &mut Output<CAPACITY>, method
         if is_optional_argument(method, index) {
             output.put("?: ");
             // An optional parameter is already `T | undefined`, so unwrap one layer.
-            match argument.desc {
-                Desc::Option(inner) => desc_type(output, inner),
-                other => desc_type(output, other),
+            match (argument.desc, option_schema(argument.desc)) {
+                (Desc::Option(inner), _) => desc_type(output, inner),
+                (_, Some(inner)) => type_reference(output, inner),
+                (other, None) => desc_type(output, other),
             }
         } else {
             output.put(": ");

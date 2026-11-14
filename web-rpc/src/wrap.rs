@@ -13,7 +13,21 @@
 //! `ImageBitmap`, the stream types, ...); anything else is a `DataCloneError` thrown by the
 //! browser at the moment of sending. A typed array is not transferable: send
 //! `Transfer<ArrayBuffer>` and rebuild the view on the other side. A view over wasm linear
-//! memory can never be transferred, so [`Post`] it instead.
+//! memory can never be transferred, so [`Post`] it instead. An object may be transferred only
+//! once per message: the same handle in two arguments, or twice in one `Vec`, is also a
+//! `DataCloneError`.
+//!
+//! The wrappers may stand alone or sit inside `Option`, `Result`, `Vec`, arrays and the
+//! values of `HashMap` and `BTreeMap`, nested to any depth. Anywhere else, such as a tuple or
+//! a field of a struct, they do not compile:
+//!
+//! ```compile_fail
+//! # use web_rpc::wrap::Transfer;
+//! #[web_rpc::service]
+//! pub trait Upload {
+//!     fn upload(&self, named: (String, Transfer<js_sys::ArrayBuffer>));
+//! }
+//! ```
 //!
 //! A bare Javascript type in a signature does not compile:
 //!

@@ -38,6 +38,15 @@ fn wire_arguments() {
         bytes(&WireArg::Err(Box::new(WireArg::Bytes(vec![7])))),
         [0x05, 0x01, 0x01, 7]
     );
+    // A sequence is its length then its items; a map entry is a postcard key then its value.
+    assert_eq!(
+        bytes(&WireArg::Seq(vec![WireArg::Js, WireArg::None])),
+        [0x06, 0x02, 0x00, 0x02]
+    );
+    assert_eq!(
+        bytes(&WireArg::Map(vec![(bytes(&"k"), WireArg::Js)])),
+        [0x07, 0x01, 0x02, 0x01, b'k', 0x00]
+    );
 }
 
 #[derive(Serialize, Deserialize, Schema, Debug, PartialEq, Eq)]
@@ -51,6 +60,7 @@ pub trait Fixture {
     fn first(&self, value: u32) -> u32;
     fn second(&self, pair: Pair, tag: Post<js_sys::JsString>) -> bool;
     fn third(&self, text: &str);
+    fn fourth(&self, maybe: Option<u32>, tags: Vec<Option<Post<js_sys::JsString>>>);
 }
 
 #[wasm_bindgen_test]
@@ -78,6 +88,15 @@ fn request_payloads() {
     assert_eq!(
         bytes(&FixtureRequest::Third { text: "hi" }),
         [0x02, 0x02, b'h', b'i']
+    );
+    // A type with no Javascript value inside it is one postcard blob, whatever its shape.
+    // Only a type that holds one is walked.
+    assert_eq!(
+        bytes(&FixtureRequest::Fourth {
+            maybe: WireArg::Bytes(bytes(&Some(1u32))),
+            tags: WireArg::Seq(vec![WireArg::Some(Box::new(WireArg::Js)), WireArg::None]),
+        }),
+        [0x03, 0x01, 0x02, 0x01, 0x01, 0x06, 0x02, 0x03, 0x00, 0x02]
     );
 }
 

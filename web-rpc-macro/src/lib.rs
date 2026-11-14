@@ -74,22 +74,6 @@ fn type_arguments<'a>(ty: &'a Type, wrapper: &str) -> Option<Vec<&'a Type>> {
         .collect()
 }
 
-/// If `ty` is `Option<T>`, returns Some(T).
-fn option_inner_type(ty: &Type) -> Option<&Type> {
-    match type_arguments(ty, "Option")?.as_slice() {
-        [inner] => Some(inner),
-        _ => None,
-    }
-}
-
-/// If `ty` is `Result<T, E>`, returns Some((T, E)).
-fn result_inner_types(ty: &Type) -> Option<(&Type, &Type)> {
-    match type_arguments(ty, "Result")?.as_slice() {
-        [ok, err] => Some((ok, err)),
-        _ => None,
-    }
-}
-
 /// If `ty` is `Post<T>` or `Transfer<T>`, returns the inner type and whether it is transferred.
 fn js_inner_type(ty: &Type) -> Option<(&Type, bool)> {
     for (wrapper, transfer) in [("Post", false), ("Transfer", true)] {
@@ -98,6 +82,98 @@ fn js_inner_type(ty: &Type) -> Option<(&Type, bool)> {
         }
     }
     None
+}
+
+/// True if a `Post` or `Transfer` appears anywhere inside `ty`.
+fn contains_js(ty: &Type) -> bool {
+    match ty {
+        Type::Path(type_path) => {
+            js_inner_type(ty).is_some()
+                || type_path.path.segments.iter().any(|segment| {
+                    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+                        return false;
+                    };
+                    arguments.args.iter().any(|argument| {
+                        matches!(argument, syn::GenericArgument::Type(ty) if contains_js(ty))
+                    })
+                })
+        }
+        Type::Array(array) => contains_js(&array.elem),
+        Type::Slice(slice) => contains_js(&slice.elem),
+        Type::Reference(reference) => contains_js(&reference.elem),
+        Type::Paren(paren) => contains_js(&paren.elem),
+        Type::Group(group) => contains_js(&group.elem),
+        Type::Tuple(tuple) => tuple.elems.iter().any(contains_js),
+        _ => false,
+    }
+}
+
+/// How a value of some type crosses the channel.
+enum Route<'a> {
+    /// No `Post` or `Transfer` inside: one postcard blob, whatever the shape.
+    Postcard,
+    /// `Post<T>` or `Transfer<T>`.
+    Js { inner: &'a Type, transfer: bool },
+    /// `Option<T>`.
+    Option(&'a Type),
+    /// `Result<T, E>`.
+    Result(&'a Type, &'a Type),
+    /// `Vec<T>`.
+    Seq(&'a Type),
+    /// `[T; N]`.
+    Array(&'a Type, &'a syn::Expr),
+    /// `HashMap<K, V>` or `BTreeMap<K, V>`, with a key free of `Post` and `Transfer`.
+    Map(&'a Type, &'a Type),
+    /// A `Post` or `Transfer` somewhere the macro cannot reach.
+    Unsupported,
+}
+
+/// Decide the route of `ty`. This is the one place the routing rule lives.
+fn route(ty: &Type) -> Route<'_> {
+    if !contains_js(ty) {
+        return Route::Postcard;
+    }
+    if let Some((inner, transfer)) = js_inner_type(ty) {
+        return Route::Js { inner, transfer };
+    }
+    if let Type::Array(array) = ty {
+        return Route::Array(&array.elem, &array.len);
+    }
+    if let Some([inner]) = type_arguments(ty, "Option").as_deref() {
+        return Route::Option(inner);
+    }
+    if let Some([ok, err]) = type_arguments(ty, "Result").as_deref() {
+        return Route::Result(ok, err);
+    }
+    if let Some([inner]) = type_arguments(ty, "Vec").as_deref() {
+        return Route::Seq(inner);
+    }
+    for map in ["HashMap", "BTreeMap"] {
+        if let Some([key, value, ..]) = type_arguments(ty, map).as_deref() {
+            if !contains_js(key) {
+                return Route::Map(key, value);
+            }
+        }
+    }
+    Route::Unsupported
+}
+
+/// Reject a `Post` or `Transfer` in a position the macro cannot route.
+fn check_route(ty: &Type) -> syn::Result<()> {
+    match route(ty) {
+        Route::Postcard | Route::Js { .. } => Ok(()),
+        Route::Option(inner) | Route::Seq(inner) | Route::Array(inner, _) => check_route(inner),
+        Route::Map(_, value) => check_route(value),
+        Route::Result(ok, err) => {
+            check_route(ok)?;
+            check_route(err)
+        }
+        Route::Unsupported => Err(syn::Error::new_spanned(
+            ty,
+            "`Post` and `Transfer` are only supported on their own or inside `Option`, \
+             `Result`, `Vec`, arrays and the values of `HashMap` and `BTreeMap`",
+        )),
+    }
 }
 
 /// True if `ty` is `&str` or `&[u8]`, the two reference shapes that keep serde's zero-copy
@@ -137,98 +213,172 @@ fn cfg_predicates(attrs: &[Attribute]) -> Vec<TokenStream2> {
 /// Recursively emit code that encodes a value of type `ty` into a `WireArg`, pushing Javascript
 /// values onto `post_args` and, for `Transfer`, onto `transfer_args` as a side effect.
 ///
-/// The emitted code matches on `&value`, so the caller's binding stays usable, and match
-/// ergonomics binds `__inner` as a reference inside each arm.
+/// The emitted code only borrows `value`, so the caller's binding stays usable, and match
+/// ergonomics binds `__inner` as a reference inside each arm and closure.
 fn emit_encode(
     ty: &Type,
     value: TokenStream2,
     post_args: &TokenStream2,
     transfer_args: &TokenStream2,
 ) -> TokenStream2 {
-    if let Some(inner) = option_inner_type(ty) {
-        let inner_encode = emit_encode(inner, quote!(__inner), post_args, transfer_args);
-        quote_spanned! {ty.span()=>
-            match &#value {
-                ::core::option::Option::Some(__inner) =>
-                    web_rpc::codec::WireArg::Some(::std::boxed::Box::new(#inner_encode)),
-                ::core::option::Option::None =>
-                    web_rpc::codec::WireArg::None,
+    let encode_inner = |inner: &Type| emit_encode(inner, quote!(__inner), post_args, transfer_args);
+    match route(ty) {
+        Route::Option(inner) => {
+            let inner_encode = encode_inner(inner);
+            quote_spanned! {ty.span()=>
+                match &#value {
+                    ::core::option::Option::Some(__inner) =>
+                        web_rpc::codec::WireArg::Some(::std::boxed::Box::new(#inner_encode)),
+                    ::core::option::Option::None =>
+                        web_rpc::codec::WireArg::None,
+                }
             }
         }
-    } else if let Some((ok, err)) = result_inner_types(ty) {
-        let ok_encode = emit_encode(ok, quote!(__inner), post_args, transfer_args);
-        let err_encode = emit_encode(err, quote!(__inner), post_args, transfer_args);
-        quote_spanned! {ty.span()=>
-            match &#value {
-                ::core::result::Result::Ok(__inner) =>
-                    web_rpc::codec::WireArg::Ok(::std::boxed::Box::new(#ok_encode)),
-                ::core::result::Result::Err(__inner) =>
-                    web_rpc::codec::WireArg::Err(::std::boxed::Box::new(#err_encode)),
+        Route::Result(ok, err) => {
+            let ok_encode = encode_inner(ok);
+            let err_encode = encode_inner(err);
+            quote_spanned! {ty.span()=>
+                match &#value {
+                    ::core::result::Result::Ok(__inner) =>
+                        web_rpc::codec::WireArg::Ok(::std::boxed::Box::new(#ok_encode)),
+                    ::core::result::Result::Err(__inner) =>
+                        web_rpc::codec::WireArg::Err(::std::boxed::Box::new(#err_encode)),
+                }
             }
         }
-    } else if let Some((_, transfer)) = js_inner_type(ty) {
-        let push_transfer = transfer.then(|| {
-            quote! { (#transfer_args).push(web_rpc::wrap::js_value(&#value.0)); }
-        });
-        quote_spanned! {ty.span()=>
-            {
-                (#post_args).push(web_rpc::wrap::js_value(&#value.0));
-                #push_transfer
-                web_rpc::codec::WireArg::Js
+        Route::Seq(inner) | Route::Array(inner, _) => {
+            let inner_encode = encode_inner(inner);
+            quote_spanned! {ty.span()=>
+                web_rpc::codec::WireArg::Seq(
+                    #value.iter().map(|__inner| #inner_encode).collect()
+                )
             }
         }
-    } else {
-        quote_spanned! {ty.span()=>
+        Route::Map(_, inner) => {
+            let inner_encode = encode_inner(inner);
+            quote_spanned! {ty.span()=>
+                web_rpc::codec::WireArg::Map(
+                    #value
+                        .iter()
+                        .map(|(__key, __inner)| {
+                            (web_rpc::postcard::to_allocvec(__key).unwrap(), #inner_encode)
+                        })
+                        .collect()
+                )
+            }
+        }
+        Route::Js { transfer, .. } => {
+            let push_transfer = transfer.then(|| {
+                quote! { (#transfer_args).push(web_rpc::wrap::js_value(&#value.0)); }
+            });
+            quote_spanned! {ty.span()=>
+                {
+                    (#post_args).push(web_rpc::wrap::js_value(&#value.0));
+                    #push_transfer
+                    web_rpc::codec::WireArg::Js
+                }
+            }
+        }
+        Route::Postcard => quote_spanned! {ty.span()=>
             web_rpc::codec::WireArg::Bytes(
                 web_rpc::postcard::to_allocvec(&#value).unwrap()
             )
-        }
+        },
+        Route::Unsupported => unreachable!("unsupported routes are rejected while parsing"),
     }
 }
 
 /// Recursively emit code that decodes a `WireArg` of type `ty` into a Rust value, shifting
 /// Javascript values off `js_values` as needed.
 fn emit_decode(ty: &Type, wire: TokenStream2, js_values: &TokenStream2) -> TokenStream2 {
-    if let Some(inner) = option_inner_type(ty) {
-        let inner_decode = emit_decode(inner, quote!(*__inner), js_values);
-        quote_spanned! {ty.span()=>
-            match #wire {
-                web_rpc::codec::WireArg::Some(__inner) =>
-                    ::core::option::Option::Some(#inner_decode),
-                web_rpc::codec::WireArg::None =>
-                    ::core::option::Option::None,
-                _ => panic!("web_rpc: wire/type mismatch, expected Some or None"),
+    match route(ty) {
+        Route::Option(inner) => {
+            let inner_decode = emit_decode(inner, quote!(*__inner), js_values);
+            quote_spanned! {ty.span()=>
+                match #wire {
+                    web_rpc::codec::WireArg::Some(__inner) =>
+                        ::core::option::Option::Some(#inner_decode),
+                    web_rpc::codec::WireArg::None =>
+                        ::core::option::Option::None,
+                    _ => panic!("web_rpc: wire/type mismatch, expected Some or None"),
+                }
             }
         }
-    } else if let Some((ok, err)) = result_inner_types(ty) {
-        let ok_decode = emit_decode(ok, quote!(*__inner), js_values);
-        let err_decode = emit_decode(err, quote!(*__inner), js_values);
-        quote_spanned! {ty.span()=>
-            match #wire {
-                web_rpc::codec::WireArg::Ok(__inner) =>
-                    ::core::result::Result::Ok(#ok_decode),
-                web_rpc::codec::WireArg::Err(__inner) =>
-                    ::core::result::Result::Err(#err_decode),
-                _ => panic!("web_rpc: wire/type mismatch, expected Ok or Err"),
+        Route::Result(ok, err) => {
+            let ok_decode = emit_decode(ok, quote!(*__inner), js_values);
+            let err_decode = emit_decode(err, quote!(*__inner), js_values);
+            quote_spanned! {ty.span()=>
+                match #wire {
+                    web_rpc::codec::WireArg::Ok(__inner) =>
+                        ::core::result::Result::Ok(#ok_decode),
+                    web_rpc::codec::WireArg::Err(__inner) =>
+                        ::core::result::Result::Err(#err_decode),
+                    _ => panic!("web_rpc: wire/type mismatch, expected Ok or Err"),
+                }
             }
         }
-    } else if let Some((inner, _)) = js_inner_type(ty) {
-        quote_spanned! {ty.span()=>
+        Route::Seq(inner) => {
+            let inner_decode = emit_decode(inner, quote!(__inner), js_values);
+            quote_spanned! {ty.span()=>
+                match #wire {
+                    web_rpc::codec::WireArg::Seq(__items) =>
+                        __items.into_iter().map(|__inner| #inner_decode).collect::<#ty>(),
+                    _ => panic!("web_rpc: wire/type mismatch, expected a sequence"),
+                }
+            }
+        }
+        Route::Array(inner, _) => {
+            let inner_decode = emit_decode(inner, quote!(__inner), js_values);
+            quote_spanned! {ty.span()=>
+                match #wire {
+                    web_rpc::codec::WireArg::Seq(__items) => {
+                        let __items = __items
+                            .into_iter()
+                            .map(|__inner| #inner_decode)
+                            .collect::<::std::vec::Vec<#inner>>();
+                        match <#ty>::try_from(__items) {
+                            ::core::result::Result::Ok(__array) => __array,
+                            ::core::result::Result::Err(_) =>
+                                panic!("web_rpc: wire/type mismatch, wrong array length"),
+                        }
+                    }
+                    _ => panic!("web_rpc: wire/type mismatch, expected a sequence"),
+                }
+            }
+        }
+        Route::Map(key, inner) => {
+            let inner_decode = emit_decode(inner, quote!(__inner), js_values);
+            quote_spanned! {ty.span()=>
+                match #wire {
+                    web_rpc::codec::WireArg::Map(__entries) => __entries
+                        .into_iter()
+                        .map(|(__key, __inner)| {
+                            (
+                                web_rpc::postcard::from_bytes::<#key>(&__key).unwrap(),
+                                #inner_decode,
+                            )
+                        })
+                        .collect::<#ty>(),
+                    _ => panic!("web_rpc: wire/type mismatch, expected a map"),
+                }
+            }
+        }
+        Route::Js { inner, .. } => quote_spanned! {ty.span()=>
             match #wire {
                 web_rpc::codec::WireArg::Js => <#ty>::new(
                     web_rpc::wasm_bindgen::JsCast::dyn_into::<#inner>((#js_values).shift()).unwrap()
                 ),
                 _ => panic!("web_rpc: wire/type mismatch, expected a Javascript value"),
             }
-        }
-    } else {
-        quote_spanned! {ty.span()=>
+        },
+        Route::Postcard => quote_spanned! {ty.span()=>
             match #wire {
                 web_rpc::codec::WireArg::Bytes(__bytes) =>
                     web_rpc::postcard::from_bytes::<#ty>(&__bytes).unwrap(),
                 _ => panic!("web_rpc: wire/type mismatch, expected postcard bytes"),
             }
-        }
+        },
+        Route::Unsupported => unreachable!("unsupported routes are rejected while parsing"),
     }
 }
 
@@ -237,21 +387,49 @@ fn emit_decode(ty: &Type, wire: TokenStream2, js_values: &TokenStream2) -> Token
 /// The `Schema` and `JsName` bounds are expressed at the signature type's own span, so a
 /// missing derive is reported at the argument or return type rather than inside the expansion.
 fn emit_desc(ty: &Type) -> TokenStream2 {
-    if let Some(inner) = option_inner_type(ty) {
-        let inner_desc = emit_desc(inner);
-        quote_spanned!(ty.span()=> &web_rpc::describe::Desc::Option(#inner_desc))
-    } else if let Some((ok, err)) = result_inner_types(ty) {
-        let ok_desc = emit_desc(ok);
-        let err_desc = emit_desc(err);
-        quote_spanned!(ty.span()=> &web_rpc::describe::Desc::Result(#ok_desc, #err_desc))
-    } else if let Some((inner, transfer)) = js_inner_type(ty) {
-        quote_spanned! {inner.span()=>
-            &web_rpc::describe::Desc::Js {
-                name: <#inner as web_rpc::describe::JsName>::NAME,
-                transfer: #transfer,
-            }
+    match route(ty) {
+        Route::Option(inner) => {
+            let inner_desc = emit_desc(inner);
+            return quote_spanned!(ty.span()=> &web_rpc::describe::Desc::Option(#inner_desc));
         }
-    } else if is_borrowed_serde_ref(ty) {
+        Route::Result(ok, err) => {
+            let ok_desc = emit_desc(ok);
+            let err_desc = emit_desc(err);
+            return quote_spanned! {ty.span()=>
+                &web_rpc::describe::Desc::Result(#ok_desc, #err_desc)
+            };
+        }
+        Route::Seq(inner) => {
+            let inner_desc = emit_desc(inner);
+            return quote_spanned!(ty.span()=> &web_rpc::describe::Desc::Seq(#inner_desc));
+        }
+        Route::Array(inner, length) => {
+            let inner_desc = emit_desc(inner);
+            return quote_spanned! {ty.span()=>
+                &web_rpc::describe::Desc::Array(#inner_desc, #length)
+            };
+        }
+        Route::Map(key, inner) => {
+            let inner_desc = emit_desc(inner);
+            return quote_spanned! {ty.span()=>
+                &web_rpc::describe::Desc::Map(
+                    <#key as web_rpc::postcard_schema::Schema>::SCHEMA,
+                    #inner_desc,
+                )
+            };
+        }
+        Route::Js { inner, transfer } => {
+            return quote_spanned! {inner.span()=>
+                &web_rpc::describe::Desc::Js {
+                    name: <#inner as web_rpc::describe::JsName>::NAME,
+                    transfer: #transfer,
+                }
+            };
+        }
+        Route::Postcard => {}
+        Route::Unsupported => unreachable!("unsupported routes are rejected while parsing"),
+    }
+    if is_borrowed_serde_ref(ty) {
         // postcard-schema implements `Schema` for `[T]` but not for `str`; the borrowed forms
         // encode identically to their owned counterparts.
         let schema_ty: Type = match ty {
@@ -928,7 +1106,12 @@ impl Parse for RpcMethod {
         for argument in content.parse_terminated(FnArg::parse, Token![,])? {
             match argument {
                 FnArg::Typed(typed) => match &*typed.pat {
-                    Pat::Ident(_) => args.push(typed),
+                    Pat::Ident(_) => {
+                        if let Err(error) = check_route(&typed.ty) {
+                            extend_errors!(errors, error);
+                        }
+                        args.push(typed)
+                    }
                     _ => extend_errors!(
                         errors,
                         syn::Error::new(
@@ -968,6 +1151,11 @@ impl Parse for RpcMethod {
                 None => MethodOutput::Value(*ty),
             },
         };
+        if let MethodOutput::Value(ty) | MethodOutput::Stream(ty) = &output {
+            if let Err(error) = check_route(ty) {
+                extend_errors!(errors, error);
+            }
+        }
         input.parse::<Token![;]>()?;
         errors?;
 

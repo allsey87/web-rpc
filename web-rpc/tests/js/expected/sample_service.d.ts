@@ -32,6 +32,10 @@ export interface Sample {
   counters(count: number): Iterable<number> | AsyncIterable<number>;
   slow(millis: number): number | Promise<number>;
   borrowed(text: string, data: Uint8Array): string | Promise<string>;
+  sizes(buffers: (ArrayBuffer)[]): (number)[] | Promise<(number)[]>;
+  named(sizes: (number)[]): Map<string, (ArrayBuffer | undefined)> | Promise<Map<string, (ArrayBuffer | undefined)>>;
+  pair(sizes: [number, number]): (ArrayBuffer)[] | Promise<(ArrayBuffer)[]>;
+  scale(value: number, factor?: number): (number | undefined) | Promise<(number | undefined)>;
 }
 
 export type SampleServiceOptions = {

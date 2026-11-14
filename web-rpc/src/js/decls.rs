@@ -75,6 +75,36 @@ pub const fn is_declared(named_type: &NamedType) -> bool {
     )
 }
 
+/// The `Ok` and `Err` schemas if this is the schema of a `Result<T, E>`.
+///
+/// A `Result` with no `Post` or `Transfer` inside it is described by its postcard schema
+/// alone, so this is how the renderers recognise a fallible method.
+pub const fn result_schema(
+    named_type: &'static NamedType,
+) -> Option<(&'static NamedType, &'static NamedType)> {
+    if !str_eq(named_type.name, "Result<T, E>") {
+        return None;
+    }
+    let DataModelType::Enum([ok, err]) = named_type.ty else {
+        return None;
+    };
+    match (ok.ty, err.ty) {
+        (DataModelVariant::TupleVariant([ok]), DataModelVariant::TupleVariant([err])) => {
+            Some((*ok, *err))
+        }
+        _ => None,
+    }
+}
+
+/// True if a method returning this resolves the `Ok` payload and rejects with the `Err`.
+pub const fn is_fallible(desc: &'static Desc) -> bool {
+    match desc {
+        Desc::Result(..) => true,
+        Desc::Postcard(named_type) => result_schema(named_type).is_some(),
+        _ => false,
+    }
+}
+
 /// Structural comparison of two schemas. Bounded in depth: two schemas still equal at the
 /// limit are taken to be equal.
 pub const fn named_type_eq(left: &NamedType, right: &NamedType, depth: usize) -> bool {
@@ -336,7 +366,13 @@ const fn collect_desc(declarations: &mut Declarations, desc: &'static Desc) {
         Desc::Postcard(named_type) | Desc::Inline(named_type) => {
             collect_named_type(declarations, named_type)
         }
-        Desc::Option(inner) => collect_desc(declarations, inner),
+        Desc::Option(inner) | Desc::Seq(inner) | Desc::Array(inner, _) => {
+            collect_desc(declarations, inner)
+        }
+        Desc::Map(key, value) => {
+            collect_named_type(declarations, key);
+            collect_desc(declarations, value);
+        }
         Desc::Result(ok, err) => {
             collect_desc(declarations, ok);
             collect_desc(declarations, err);

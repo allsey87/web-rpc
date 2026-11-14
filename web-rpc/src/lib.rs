@@ -9,8 +9,10 @@
 //! Routing is explicit. A value wrapped in [`Post`](wrap::Post) or [`Transfer`](wrap::Transfer)
 //! crosses the channel as a Javascript value through `postMessage`; anything else is encoded
 //! with [postcard](https://docs.rs/postcard) and must implement
-//! [`postcard_schema::Schema`]. There is special support for `Option<T>` and `Result<T, E>`
-//! so that Javascript values can be embedded within them, and this behaviour is recursive.
+//! [`postcard_schema::Schema`]. Javascript values can be embedded in `Option<T>`,
+//! `Result<T, E>`, `Vec<T>`, `[T; N]` and the values of `HashMap<K, V>` and `BTreeMap<K, V>`,
+//! and this behaviour is recursive. A type with no Javascript value inside it is always one
+//! postcard payload.
 //!
 //! # Quickstart
 //! ```rust
@@ -77,6 +79,8 @@
 //!     fn upload(&self, buffer: Transfer<js_sys::ArrayBuffer>) -> u32;
 //!     // `Option`/`Result` recurse: each variant routes independently.
 //!     fn lookup(&self, k: u32) -> Result<Option<Post<js_sys::JsString>>, String>;
+//!     // So do `Vec`, arrays and map values: each element routes independently.
+//!     fn split(&self, parts: u32) -> Vec<Transfer<js_sys::ArrayBuffer>>;
 //!     // `&str` / `&[u8]` deserialize zero-copy on the server.
 //!     fn count(&self, data: &[u8]) -> u32;
 //! }

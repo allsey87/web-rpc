@@ -8,7 +8,7 @@
 use postcard_schema::schema::{DataModelType, DataModelVariant, NamedType, NamedValue};
 
 use super::{
-    decls::{collect, is_declared},
+    decls::{collect, is_declared, is_fallible},
     method_at, method_count,
     writer::Output,
     Endpoint, SHELL,
@@ -186,6 +186,25 @@ const fn wire_description<const CAPACITY: usize>(
             wire_description(output, err);
             output.put(" }");
         }
+        Desc::Seq(inner) => {
+            output.put("{ kind: \"seq\", inner: ");
+            wire_description(output, inner);
+            output.put(" }");
+        }
+        Desc::Array(inner, length) => {
+            output.put("{ kind: \"seq\", inner: ");
+            wire_description(output, inner);
+            output.put(", length: ");
+            output.put_usize(*length);
+            output.put(" }");
+        }
+        Desc::Map(key, value) => {
+            output.put("{ kind: \"map\", key: ");
+            schema_reference(output, key);
+            output.put(", value: ");
+            wire_description(output, value);
+            output.put(" }");
+        }
     }
 }
 
@@ -236,6 +255,11 @@ const fn method_entry<const CAPACITY: usize>(
     match method.ret {
         Return::Notify => output.put("null"),
         Return::Value(desc) | Return::Stream(desc) => wire_description(output, desc),
+    }
+    if let Return::Value(desc) = method.ret {
+        if is_fallible(desc) {
+            output.put(", fallible: true");
+        }
     }
     output.put(" },\n");
 }

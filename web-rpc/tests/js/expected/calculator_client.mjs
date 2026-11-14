@@ -25,6 +25,8 @@ const WIRE_NONE = 2;
 const WIRE_SOME = 3;
 const WIRE_OK = 4;
 const WIRE_ERR = 5;
+const WIRE_SEQ = 6;
+const WIRE_MAP = 7;
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
@@ -293,6 +295,11 @@ function expectTag(actual, expected, what) {
  *   { kind: "inline", schema }     postcard bytes with no tag and no length
  *   { kind: "option", inner }
  *   { kind: "result", ok, err }    `{ tag: "Ok", value }` or `{ tag: "Err", value }`
+ *   { kind: "seq", inner, length } an array, of exactly `length` items if it is given
+ *   { kind: "map", key, value }    a `Map`; `key` is a schema, `value` a wire description
+ *
+ * The last four only describe a type that holds a Javascript value somewhere. Any other
+ * type is "postcard", whatever its shape.
  */
 export class Codec {
   constructor(schemas) {
@@ -468,6 +475,28 @@ export class Codec {
           throw new TypeError('web-rpc: expected { tag: "Ok" } or { tag: "Err" }');
         }
         return;
+      case "seq":
+        if (!Array.isArray(value)) throw new TypeError("web-rpc: expected an array");
+        if (description.length !== undefined && value.length !== description.length) {
+          throw new TypeError(`web-rpc: expected an array of ${description.length} items`);
+        }
+        writer.varint32(WIRE_SEQ);
+        writer.varint32(value.length);
+        for (const item of value) {
+          this.encodeWire(description.inner, writer, item, jsValues, transferList);
+        }
+        return;
+      case "map":
+        if (!(value instanceof Map)) throw new TypeError("web-rpc: expected a Map");
+        writer.varint32(WIRE_MAP);
+        writer.varint32(value.size);
+        for (const [key, item] of value) {
+          const inner = new Writer();
+          this.encode(description.key, inner, key);
+          writer.bytes(inner.take());
+          this.encodeWire(description.value, writer, item, jsValues, transferList);
+        }
+        return;
       default:
         throw new TypeError(`web-rpc: unknown wire kind ${description.kind}`);
     }
@@ -493,6 +522,25 @@ export class Codec {
         }
         expectTag(tag, WIRE_ERR, "a result");
         return { tag: "Err", value: this.decodeWire(description.err, reader, jsValues) };
+      case "seq": {
+        expectTag(tag, WIRE_SEQ, "a sequence");
+        const length = reader.varint32();
+        const items = [];
+        for (let index = 0; index < length; index += 1) {
+          items.push(this.decodeWire(description.inner, reader, jsValues));
+        }
+        return items;
+      }
+      case "map": {
+        expectTag(tag, WIRE_MAP, "a map");
+        const length = reader.varint32();
+        const map = new Map();
+        for (let index = 0; index < length; index += 1) {
+          const key = this.decode(description.key, reader.sub());
+          map.set(key, this.decodeWire(description.value, reader, jsValues));
+        }
+        return map;
+      }
       default:
         throw new TypeError(`web-rpc: unknown wire kind ${description.kind}`);
     }
@@ -501,7 +549,7 @@ export class Codec {
 
 /** True when a method's promise resolves the `Ok` payload and rejects with the `Err`. */
 function isFallible(method) {
-  return method.kind === "value" && method.returns.kind === "result";
+  return method.fallible === true;
 }
 
 /**
@@ -558,8 +606,8 @@ function reduceThrown(thrown) {
  * `methods` describes the trait this endpoint calls and `handlers` the trait it implements.
  * Each entry is `{ name, kind, args, returns }`, where `kind` is "value", "notify" or
  * "stream", `args` is a list of wire descriptions, and `returns` is the wire description of
- * the response or stream item, or null for a notification. An entry's position is the
- * method's index on the wire.
+ * the response or stream item, or null for a notification. An entry whose method returns a
+ * `Result` also has `fallible: true`. An entry's position is the method's index on the wire.
  */
 class Endpoint {
   constructor(options, className, codec, methods, handlers) {
@@ -966,18 +1014,21 @@ const METHODS = [
   { name: "note", kind: "notify", args: [{ kind: "postcard", schema: "string" }], returns: null },
   { name: "describe", kind: "value", args: [{ kind: "postcard", schema: { kind: "ref", name: "Shape" } }], returns: { kind: "postcard", schema: { kind: "ref", name: "Everything" } } },
   { name: "echo", kind: "value", args: [{ kind: "js", transfer: false }], returns: { kind: "js", transfer: false } },
-  { name: "upload", kind: "value", args: [{ kind: "js", transfer: true }], returns: { kind: "result", ok: { kind: "postcard", schema: "u32" }, err: { kind: "postcard", schema: "string" } } },
-  { name: "lookup", kind: "value", args: [{ kind: "postcard", schema: "u32" }], returns: { kind: "result", ok: { kind: "option", inner: { kind: "js", transfer: false } }, err: { kind: "postcard", schema: { kind: "ref", name: "Colour" } } } },
+  { name: "upload", kind: "value", args: [{ kind: "js", transfer: true }], returns: { kind: "postcard", schema: { kind: "enum", variants: [["Ok", { kind: "newtype", inner: "u32" }], ["Err", { kind: "newtype", inner: "string" }]] } }, fallible: true },
+  { name: "lookup", kind: "value", args: [{ kind: "postcard", schema: "u32" }], returns: { kind: "result", ok: { kind: "option", inner: { kind: "js", transfer: false } }, err: { kind: "postcard", schema: { kind: "ref", name: "Colour" } } }, fallible: true },
   { name: "counters", kind: "stream", args: [{ kind: "postcard", schema: "u32" }], returns: { kind: "postcard", schema: "u32" } },
-  { name: "tail", kind: "value", args: [{ kind: "postcard", schema: "u32" }, { kind: "option", inner: { kind: "postcard", schema: "u32" } }], returns: { kind: "postcard", schema: "u32" } },
+  { name: "tail", kind: "value", args: [{ kind: "postcard", schema: "u32" }, { kind: "postcard", schema: { kind: "option", inner: "u32" } }], returns: { kind: "postcard", schema: "u32" } },
   { name: "nothing", kind: "notify", args: [], returns: null },
   { name: "borrowed", kind: "value", args: [{ kind: "inline", schema: "string" }, { kind: "inline", schema: { kind: "seq", inner: "u8" } }], returns: { kind: "postcard", schema: "u32" } },
+  { name: "batch", kind: "value", args: [{ kind: "seq", inner: { kind: "js", transfer: true } }], returns: { kind: "postcard", schema: { kind: "seq", inner: "u32" } } },
+  { name: "corners", kind: "value", args: [{ kind: "postcard", schema: { kind: "tuple", items: [{ kind: "ref", name: "Point" }, { kind: "ref", name: "Point" }] } }], returns: { kind: "seq", inner: { kind: "option", inner: { kind: "js", transfer: false } }, length: 2 } },
+  { name: "index", kind: "value", args: [{ kind: "postcard", schema: { kind: "option", inner: { kind: "seq", inner: "string" } } }], returns: { kind: "result", ok: { kind: "map", key: "string", value: { kind: "seq", inner: { kind: "js", transfer: true } } }, err: { kind: "postcard", schema: { kind: "ref", name: "Colour" } } }, fallible: true },
 ];
 
 const HANDLERS = [
   { name: "ping", kind: "value", args: [], returns: { kind: "postcard", schema: "u32" } },
   { name: "colours", kind: "stream", args: [{ kind: "postcard", schema: "u32" }], returns: { kind: "postcard", schema: { kind: "ref", name: "Colour" } } },
-  { name: "delete_", kind: "value", args: [{ kind: "postcard", schema: { kind: "ref", name: "Point" } }], returns: { kind: "result", ok: { kind: "postcard", schema: { kind: "ref", name: "Point" } }, err: { kind: "postcard", schema: "string" } } },
+  { name: "delete_", kind: "value", args: [{ kind: "postcard", schema: { kind: "ref", name: "Point" } }], returns: { kind: "postcard", schema: { kind: "enum", variants: [["Ok", { kind: "newtype", inner: { kind: "ref", name: "Point" } }], ["Err", { kind: "newtype", inner: "string" }]] } }, fallible: true },
 ];
 
 export class CalculatorClient extends Endpoint {
@@ -1013,5 +1064,14 @@ export class CalculatorClient extends Endpoint {
   }
   borrowed(text, data) {
     return this._request(9, [text, data]);
+  }
+  batch(buffers) {
+    return this._request(10, [buffers]);
+  }
+  corners(points) {
+    return this._request(11, [points]);
+  }
+  index(names) {
+    return this._request(12, [names]);
   }
 }

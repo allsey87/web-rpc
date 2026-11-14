@@ -41,6 +41,9 @@ export declare class CalculatorClient {
   tail(delete_: number, extra?: number): Request<number>;
   nothing(): void;
   borrowed(text: string, data: Uint8Array): Request<number>;
+  batch(buffers: (ArrayBuffer)[]): Request<(number)[]>;
+  corners(points: [Point, Point]): Request<((string | undefined))[]>;
+  index(names?: (string)[]): Request<Map<string, (ArrayBuffer)[]>>;
   /** Detach listeners, reject pending requests and close open streams. */
   close(): void;
 }

@@ -106,3 +106,30 @@ test("wire arguments", () => {
   );
   assert.deepEqual(result, { tag: "Err", value: 7 });
 });
+
+test("wire sequences and maps", () => {
+  const codec = new Codec({});
+  const js = { kind: "js", transfer: true };
+  const sequence = { kind: "seq", inner: { kind: "option", inner: js } };
+  const map = { kind: "map", key: "string", value: js };
+  const jsValues = [];
+  const transferList = [];
+  const writer = new Writer();
+  codec.encodeWire(sequence, writer, ["first", undefined], jsValues, transferList);
+  codec.encodeWire(map, writer, new Map([["k", "second"]]), jsValues, transferList);
+  const bytes = writer.take();
+  assert.deepEqual(
+    Array.from(bytes),
+    [0x06, 0x02, 0x03, 0x00, 0x02, 0x07, 0x01, 0x02, 0x01, 0x6b, 0x00],
+  );
+  assert.deepEqual(jsValues, ["first", "second"]);
+  assert.deepEqual(transferList, ["first", "second"]);
+
+  const reader = new Reader(bytes);
+  assert.deepEqual(codec.decodeWire(sequence, reader, jsValues), ["first", undefined]);
+  assert.deepEqual(codec.decodeWire(map, reader, jsValues), new Map([["k", "second"]]));
+
+  // An array type carries its length, which is checked before anything is written.
+  const pair = { kind: "seq", inner: js, length: 2 };
+  assert.throws(() => codec.encodeWire(pair, new Writer(), ["only"], [], []), TypeError);
+});

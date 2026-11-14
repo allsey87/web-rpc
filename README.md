@@ -50,7 +50,7 @@ assert_eq!(client.add(41, 1).await, 42);
 
 ## Features
 - **Explicit routing**: `Post<T>` crosses as a JavaScript value copied by structured clone, `Transfer<T>` crosses as one that is moved onto the `postMessage` transfer list. Everything else is postcard-encoded and must implement `postcard_schema::Schema`.
-- **`Option`/`Result` wrappers (and nested)**: each variant routes independently, so `Result<Transfer<ArrayBuffer>, RustError>` and `Result<Option<Post<JsT>>, _>` just work, with no attribute.
+- **Containers (and nested)**: `Option`, `Result`, `Vec`, arrays and the values of `HashMap`/`BTreeMap` route each element independently, so `Result<Transfer<ArrayBuffer>, RustError>`, `Vec<Transfer<ArrayBuffer>>` and `Option<Vec<Post<JsT>>>` just work, with no attribute.
 - **Bidirectional RPC** over a single channel, with both ends simultaneously acting as client and server.
 - **Streaming RPCs** via `impl Stream<Item = T>` returns, with abort-on-drop and close-and-drain.
 - **Async or sync** server methods, with per-request cancellation when the client drops the future of an RPC method that returns.

@@ -43,9 +43,9 @@ pub struct Arg {
 
 /// How one value crosses the channel.
 ///
-/// This mirrors [`crate::codec::WireArg`]: the `Option` and `Result` variants describe the
-/// wrapper structure that the macro walks, and the leaves say whether the value travels as a
-/// Javascript value or as postcard bytes.
+/// This mirrors [`crate::codec::WireArg`]. A type with no [`crate::wrap::Post`] or
+/// [`crate::wrap::Transfer`] inside it is a single postcard leaf, whatever its shape. The
+/// container variants only describe types that hold a Javascript value somewhere.
 pub enum Desc {
     /// A [`crate::wrap::Post`] or [`crate::wrap::Transfer`] leaf.
     Js {
@@ -63,6 +63,13 @@ pub enum Desc {
     Option(&'static Desc),
     /// `Result<T, E>`, whose `Ok` and `Err` route independently.
     Result(&'static Desc, &'static Desc),
+    /// `Vec<T>`, whose items route independently.
+    Seq(&'static Desc),
+    /// `[T; N]`, whose items route independently, and its length.
+    Array(&'static Desc, usize),
+    /// `HashMap<K, V>` or `BTreeMap<K, V>`, with a postcard-encoded key and values that
+    /// route independently.
+    Map(&'static NamedType, &'static Desc),
 }
 
 /// What a method sends back.
